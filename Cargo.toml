@@ -4,4 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+criterion = "0.8.2"
 memmap2 = "0.9.10"
+rand = "0.10.0"
+
+[dependencies.xxhash-rust]
+version = "0.8.15"
+features = ["xxh3", "xxh64", "xxh32"]
+
+[[bench]]
+name = "hash"
+harness = false
