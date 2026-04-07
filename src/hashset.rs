@@ -394,28 +394,26 @@ impl HashSet {
         let h2: u8 = key_hash as u8 & 0b01_11_11_11;
 
         let mut group_id = key_hash >> self.h1_shift;
-        let mut ctrl_group_ptr =
-            unsafe { self.data_file_mmap.as_ptr().add((group_id * 16) as usize) };
         let mut nb_probing = 0;
+
         loop {
+            let ctrl_group_ptr = unsafe { self.ptr.ctrl.add(group_id as usize * 16) };
             let ctrl_group_simd = unsafe { _mm_loadu_si128(ctrl_group_ptr as *const __m128i) };
 
             let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
             while candidate_mask != 0 {
                 //Iter on each candidate
-                let key_index_in_group = candidate_mask.trailing_zeros() as u64;
+                let key_idx_in_group = candidate_mask.trailing_zeros() as u64;
 
-                let candidate_key_idx = (self.nb_slot as usize
-                    + (16 * group_id + key_index_in_group) as usize * size_of::<u64>());
-
-                let candidate_key = u64::from_be_bytes(
-                    self.data_file_mmap[candidate_key_idx..(candidate_key_idx + size_of::<u64>())]
-                        .try_into()
-                        .unwrap(),
-                );
-
-                if candidate_key == key {
-                    return true;
+                unsafe {
+                    if *self
+                        .ptr
+                        .key
+                        .add(16 * group_id as usize + key_idx_in_group as usize)
+                        == key
+                    {
+                        return false;
+                    }
                 }
 
                 candidate_mask &= candidate_mask - 1; //remove the 1 most to the right
@@ -426,15 +424,10 @@ impl HashSet {
                 return false;
             }
 
-            unsafe {
-                nb_probing += 1;
-                group_id += nb_probing;
-                if group_id < self.nb_group {
-                    ctrl_group_ptr = ctrl_group_ptr.add((group_id * 16) as usize);
-                } else {
-                    group_id &= self.nb_group - 1; //nb_group is a pow of 2
-                    ctrl_group_ptr = self.data_file_mmap.as_ptr().add((group_id * 16) as usize);
-                }
+            nb_probing += 1;
+            group_id += nb_probing;
+            if group_id >= self.nb_group {
+                group_id &= self.nb_group - 1; //nb_group is a pow of 2
             }
         }
     }
