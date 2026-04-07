@@ -1,3 +1,9 @@
+# Build directory
 /target
+
+# Directory for data test
 /data
-/docs
+
+# Draw.io temp/backup file
+*.bkp
+*.dtmp
