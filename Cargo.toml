@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 criterion = "0.8.2"
+either = "1.15.0"
 memmap2 = "0.9.10"
 rand = "0.10.0"
 tokio = { version = "1.51.0", features = ["full"] }

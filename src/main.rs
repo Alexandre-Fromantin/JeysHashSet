@@ -1,6 +1,6 @@
 use std::{path::Path, time::Instant};
 
-use tokio::io;
+use tokio::{fs::remove_file, io};
 
 use crate::hashset::HashSet;
 
@@ -8,26 +8,22 @@ mod hashset;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let mut hash_set: HashSet = HashSet::new(Path::new("data/"), 24).await.unwrap();
+    let mut hash_set: HashSet = HashSet::new(Path::new("data/"), 26).await.unwrap();
 
-    let mut time = Instant::now();
-    for i in 0..10_000_000 {
-        hash_set.contains(i);
-    }
-    println!("10M check: {:?}", time.elapsed());
+    let mut data = Vec::with_capacity(512);
 
-    time = Instant::now();
-    for i in 0..10_000 {
-        hash_set.insert(i).await;
-    }
-    println!("10K inserted: {:?}", time.elapsed());
-
-    /*for i in 0..1_000_000 {
-        let exists = hash_set.exists(i);
-        if !exists {
-            println!("error")
+    let time = Instant::now();
+    for i in 0..100000 {
+        data.clear();
+        for y in 0..512 {
+            data.push(i * 512 + y);
         }
-    }*/
+        hash_set.batch_insert(&data).await;
+    }
+    println!("time: {:?}", time.elapsed());
+
+    remove_file("data/data.bin").await?;
+    remove_file("data/journal.bin").await?;
 
     Ok(())
 }
