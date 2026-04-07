@@ -3,18 +3,19 @@ use memmap2::MmapMut;
 use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::ptr;
-use std::time::Instant;
 use std::{io, path::Path};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use xxhash_rust::xxh3::xxh3_64;
 
 const DELETE_FLAG: u8 = 0xFE;
 const EMPTY_FLAG: u8 = 0xFF;
 
+const NB_KEY_IN_EACH_GROUP: usize = 16;
+
 struct TempModifGroup {
-    ctrl: [u8; 16],
-    key: [u64; 16],
+    ctrl: [u8; NB_KEY_IN_EACH_GROUP],
+    key: [u64; NB_KEY_IN_EACH_GROUP],
 }
 
 struct GroupPtr {
@@ -27,8 +28,8 @@ pub struct HashSet {
     journal_file: File,
     data_file_mmap: MmapMut,
     h1_shift: usize,
-    nb_group: u64,
-    nb_slot: u64,
+    nb_group: usize,
+    nb_slot: usize,
     ptr: HashSetPtr,
     batching: HashSetBatching,
 }
@@ -39,7 +40,7 @@ struct HashSetPtr {
 }
 
 struct HashSetBatching {
-    temp_modif_hashmap: HashMap<u64, TempModifGroup>,
+    temp_modif_hashmap: HashMap<usize, TempModifGroup>,
     batch_insert_result: Vec<bool>,
     journal_log: Vec<u8>,
 }
@@ -67,16 +68,16 @@ impl HashSet {
             .open(journal_file_path)
             .await?;
 
-        let nb_group = 2u64.pow(degree);
-        let nb_slot = nb_group * 16;
+        let nb_group = 2usize.pow(degree);
+        let nb_slot = nb_group * NB_KEY_IN_EACH_GROUP;
 
         data_file
-            .set_len(nb_slot * (1 + size_of::<u64>() as u64))
+            .set_len((nb_slot * (1 + size_of::<u64>())) as u64)
             .await?;
         journal_file.set_len(1_000_000).await?;
 
         let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
-        data_file_mmap[..(nb_slot as usize)].fill(EMPTY_FLAG);
+        data_file_mmap[..nb_slot].fill(EMPTY_FLAG);
         let data_file_mmap_ptr = data_file_mmap.as_mut_ptr();
 
         Ok(Self {
@@ -88,7 +89,7 @@ impl HashSet {
             nb_slot,
             ptr: HashSetPtr {
                 ctrl: data_file_mmap_ptr,
-                key: unsafe { data_file_mmap_ptr.add(nb_slot as usize) as *mut u64 },
+                key: unsafe { data_file_mmap_ptr.add(nb_slot) as *mut u64 },
             },
             batching: HashSetBatching {
                 temp_modif_hashmap: HashMap::new(),
@@ -107,21 +108,21 @@ impl HashSet {
             .await?;
 
         let journal_file_path = Path::new(directory_path).join("journal.bin");
-        let mut journal_file = OpenOptions::new()
+        let journal_file = OpenOptions::new()
             .read(true)
             .append(true)
             .open(journal_file_path)
             .await?;
 
-        let data_file_len = data_file.metadata().await?.len();
-        let nb_slot = data_file_len / (1 + size_of::<u64>() as u64);
-        let nb_group = data_file_len / 16;
+        let data_file_len = data_file.metadata().await?.len() as usize;
+        let nb_slot = data_file_len / (1 + size_of::<u64>());
+        let nb_group = data_file_len / NB_KEY_IN_EACH_GROUP;
         let degree = nb_group.trailing_zeros();
 
         let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
         let data_file_mmap_ptr = data_file_mmap.as_mut_ptr();
 
-        let mut journal_read_buf = vec![0u8; 16 * 1024].into_boxed_slice();
+        /*let mut journal_read_buf = vec![0u8; 16 * 1024].into_boxed_slice();
         loop {
             let read_size = journal_file.read(&mut journal_read_buf).await?;
 
@@ -130,7 +131,7 @@ impl HashSet {
             if read_size != 16 * 1024 {
                 break;
             }
-        }
+        }*/
 
         Ok(Self {
             data_file,
@@ -141,7 +142,7 @@ impl HashSet {
             nb_slot,
             ptr: HashSetPtr {
                 ctrl: data_file_mmap_ptr,
-                key: unsafe { data_file_mmap_ptr.add(nb_slot as usize) as *mut u64 },
+                key: unsafe { data_file_mmap_ptr.add(nb_slot) as *mut u64 },
             },
             batching: HashSetBatching {
                 temp_modif_hashmap: HashMap::with_capacity(512),
@@ -152,7 +153,7 @@ impl HashSet {
     }
 
     pub async fn insert(&mut self, key: u64) -> bool {
-        let key_hash = xxh3_64(&key.to_be_bytes());
+        let key_hash = xxh3_64(&key.to_be_bytes()) as usize;
         let h2: u8 = key_hash as u8 & 0b01_11_11_11;
 
         let mut selected_slot_opt: Option<usize> = None;
@@ -161,19 +162,19 @@ impl HashSet {
         let mut nb_probing = 0;
 
         loop {
-            let ctrl_group_ptr = unsafe { self.ptr.ctrl.add(group_id as usize * 16) };
+            let ctrl_group_ptr = unsafe { self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
             let ctrl_group_simd = unsafe { _mm_loadu_si128(ctrl_group_ptr as *const __m128i) };
 
             let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
             while candidate_mask != 0 {
                 //Iter on each candidate
-                let key_idx_in_group = candidate_mask.trailing_zeros();
+                let key_idx_in_group = candidate_mask.trailing_zeros() as usize;
 
                 unsafe {
                     if *self
                         .ptr
                         .key
-                        .add(16 * group_id as usize + key_idx_in_group as usize)
+                        .add(NB_KEY_IN_EACH_GROUP * group_id + key_idx_in_group)
                         == key
                     {
                         return false;
@@ -192,7 +193,7 @@ impl HashSet {
                     } else {
                         empty_mask.trailing_zeros()
                     } as usize;
-                    selected_slot_opt = Some(group_id as usize * 16 + key_index_in_group as usize);
+                    selected_slot_opt = Some(group_id * NB_KEY_IN_EACH_GROUP + key_index_in_group);
                 }
                 break;
             }
@@ -201,7 +202,7 @@ impl HashSet {
                 let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
                 if delete_mask != 0 {
                     let key_index_in_group = delete_mask.trailing_zeros() as usize;
-                    selected_slot_opt = Some(group_id as usize * 16 + key_index_in_group as usize);
+                    selected_slot_opt = Some(group_id * NB_KEY_IN_EACH_GROUP + key_index_in_group);
                 }
             }
 
@@ -250,17 +251,17 @@ impl HashSet {
         self.journal_file.sync_all().await.unwrap();
 
         //update file mmap
-        for (group_id, modif) in &self.batching.temp_modif_hashmap {
+        for (&group_id, modif) in &self.batching.temp_modif_hashmap {
             unsafe {
                 ptr::copy_nonoverlapping(
                     modif.ctrl.as_ptr(),
-                    self.ptr.ctrl.add(*group_id as usize * 16),
-                    16,
+                    self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP),
+                    NB_KEY_IN_EACH_GROUP,
                 );
                 ptr::copy_nonoverlapping(
                     modif.key.as_ptr(),
-                    self.ptr.key.add(*group_id as usize * 16),
-                    16,
+                    self.ptr.key.add(group_id * NB_KEY_IN_EACH_GROUP),
+                    NB_KEY_IN_EACH_GROUP,
                 );
             }
         }
@@ -269,10 +270,10 @@ impl HashSet {
     }
 
     async fn batch_insert_one_key(&mut self, key: u64) -> bool {
-        let key_hash = xxh3_64(&key.to_be_bytes());
+        let key_hash = xxh3_64(&key.to_be_bytes()) as usize;
         let h2: u8 = key_hash as u8 & 0b01_11_11_11;
 
-        let mut selected_slot_opt: Option<(Either<u64, GroupPtr>, u8)> = None;
+        let mut selected_slot_opt: Option<(Either<usize, GroupPtr>, u8)> = None;
 
         let mut group_id = key_hash >> self.h1_shift;
         let mut nb_probing = 0;
@@ -281,8 +282,8 @@ impl HashSet {
                 self.batching.temp_modif_hashmap.get_mut(&group_id).map_or(
                     (true, unsafe {
                         GroupPtr {
-                            ctrl: self.ptr.ctrl.add(group_id as usize * 16),
-                            key: self.ptr.key.add(group_id as usize * 16),
+                            ctrl: self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP),
+                            key: self.ptr.key.add(group_id * NB_KEY_IN_EACH_GROUP),
                         }
                     }),
                     |temp_group| {
@@ -300,10 +301,10 @@ impl HashSet {
             let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
             while candidate_mask != 0 {
                 //Iter on each candidate
-                let key_idx_in_group = candidate_mask.trailing_zeros();
+                let key_idx_in_group = candidate_mask.trailing_zeros() as usize;
 
                 unsafe {
-                    if *group_ptr.key.add(key_idx_in_group as usize) == key {
+                    if *group_ptr.key.add(key_idx_in_group) == key {
                         return false;
                     }
                 }
@@ -315,10 +316,11 @@ impl HashSet {
                 if selected_slot_opt.is_none() {
                     let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
                     let key_index_in_group = if delete_mask != 0 {
-                        delete_mask.trailing_zeros() as usize
+                        delete_mask
                     } else {
-                        empty_mask.trailing_zeros() as usize
-                    };
+                        empty_mask
+                    }
+                    .trailing_zeros() as usize;
                     if is_on_mmap {
                         selected_slot_opt =
                             Some((Either::Left(group_id), key_index_in_group as u8));
@@ -333,7 +335,7 @@ impl HashSet {
             if selected_slot_opt.is_none() {
                 let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
                 if delete_mask != 0 {
-                    let key_index_in_group = delete_mask.trailing_zeros() as usize;
+                    let key_index_in_group = delete_mask.trailing_zeros();
                     if is_on_mmap {
                         selected_slot_opt =
                             Some((Either::Left(group_id), key_index_in_group as u8));
@@ -354,18 +356,18 @@ impl HashSet {
         let (group, slot_idx_in_group) = selected_slot_opt.unwrap(); //safe unwrap
         match group {
             Either::Left(selected_group_id) => {
-                let mut ctrl_slice = [0u8; 16];
-                let mut key_slice = [0u64; 16];
+                let mut ctrl_slice = [0u8; NB_KEY_IN_EACH_GROUP];
+                let mut key_slice = [0u64; NB_KEY_IN_EACH_GROUP];
                 unsafe {
                     ptr::copy_nonoverlapping(
-                        self.ptr.ctrl.add(group_id as usize * 16),
+                        self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP),
                         ctrl_slice.as_mut_ptr(),
-                        16,
+                        NB_KEY_IN_EACH_GROUP,
                     );
                     ptr::copy_nonoverlapping(
-                        self.ptr.key.add(group_id as usize * 16),
+                        self.ptr.key.add(group_id * NB_KEY_IN_EACH_GROUP),
                         key_slice.as_mut_ptr(),
-                        16,
+                        NB_KEY_IN_EACH_GROUP,
                     );
                 }
                 ctrl_slice[slot_idx_in_group as usize] = h2;
@@ -390,26 +392,26 @@ impl HashSet {
     }
 
     pub fn contains(&self, key: u64) -> bool {
-        let key_hash = xxh3_64(&key.to_be_bytes());
+        let key_hash = xxh3_64(&key.to_be_bytes()) as usize;
         let h2: u8 = key_hash as u8 & 0b01_11_11_11;
 
         let mut group_id = key_hash >> self.h1_shift;
         let mut nb_probing = 0;
 
         loop {
-            let ctrl_group_ptr = unsafe { self.ptr.ctrl.add(group_id as usize * 16) };
+            let ctrl_group_ptr = unsafe { self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
             let ctrl_group_simd = unsafe { _mm_loadu_si128(ctrl_group_ptr as *const __m128i) };
 
             let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
             while candidate_mask != 0 {
                 //Iter on each candidate
-                let key_idx_in_group = candidate_mask.trailing_zeros() as u64;
+                let key_idx_in_group = candidate_mask.trailing_zeros() as usize;
 
                 unsafe {
                     if *self
                         .ptr
                         .key
-                        .add(16 * group_id as usize + key_idx_in_group as usize)
+                        .add(NB_KEY_IN_EACH_GROUP * group_id + key_idx_in_group)
                         == key
                     {
                         return false;
