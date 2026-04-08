@@ -9,6 +9,7 @@ either = "1.15.0"
 memmap2 = "0.9.10"
 rand = "0.10.0"
 tokio = { version = "1.51.0", features = ["full"] }
+zerocopy = { version = "0.8.48", features = ["derive"] }
 
 [dependencies.xxhash-rust]
 version = "0.8.15"

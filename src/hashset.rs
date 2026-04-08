@@ -2,16 +2,28 @@ use either::Either;
 use memmap2::MmapMut;
 use std::arch::x86_64::*;
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::ptr;
+use std::time::Instant;
 use std::{io, path::Path};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use xxhash_rust::xxh3::xxh3_64;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 const DELETE_FLAG: u8 = 0xFE;
 const EMPTY_FLAG: u8 = 0xFF;
 
 const NB_KEY_IN_EACH_GROUP: usize = 16;
+
+#[derive(IntoBytes, FromBytes, Immutable)]
+#[repr(C)]
+struct HashSetConfig {
+    degree: u8,
+}
+
+const CONFIG_SIZE: usize = size_of::<HashSetConfig>();
+const ALIGNED_CONFIG_SIZE: usize = CONFIG_SIZE + (64 - CONFIG_SIZE % 64); //cache friendly
 
 struct TempModifGroup {
     ctrl: [u8; NB_KEY_IN_EACH_GROUP],
@@ -51,9 +63,9 @@ struct HashSetJournalLine {
 }
 
 impl HashSet {
-    pub async fn new(directory_path: &Path, degree: u32) -> io::Result<Self> {
+    pub async fn new(directory_path: &Path, degree: u8) -> io::Result<Self> {
         let data_file_path = Path::new(directory_path).join("data.bin");
-        let data_file = OpenOptions::new()
+        let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
@@ -68,7 +80,7 @@ impl HashSet {
             .open(journal_file_path)
             .await?;
 
-        let nb_group = 2usize.pow(degree);
+        let nb_group = 2usize.pow(degree as u32);
         let nb_slot = nb_group * NB_KEY_IN_EACH_GROUP;
 
         data_file
@@ -76,9 +88,26 @@ impl HashSet {
             .await?;
         journal_file.set_len(1_000_000).await?;
 
+        let config = HashSetConfig { degree };
+        data_file.write_all(config.as_bytes()).await.unwrap();
+        data_file
+            .seek(SeekFrom::Start(ALIGNED_CONFIG_SIZE as u64))
+            .await
+            .unwrap(); //cache friendly for mmap
+
+        let write_buf = vec![EMPTY_FLAG; 8 * 1024].into_boxed_slice();
+        for i in 0..(nb_slot / (8 * 1024)) {
+            data_file.write_all(&write_buf).await.unwrap();
+        }
+        data_file
+            .write_all(&write_buf[0..nb_slot % (8 * 1024)])
+            .await
+            .unwrap();
+
+        data_file.sync_all().await.unwrap();
+
         let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
-        data_file_mmap[..nb_slot].fill(EMPTY_FLAG);
-        let data_file_mmap_ptr = data_file_mmap.as_mut_ptr();
+        let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
 
         Ok(Self {
             data_file,
@@ -88,8 +117,8 @@ impl HashSet {
             nb_group,
             nb_slot,
             ptr: HashSetPtr {
-                ctrl: data_file_mmap_ptr,
-                key: unsafe { data_file_mmap_ptr.add(nb_slot) as *mut u64 },
+                ctrl: ctrl_ptr,
+                key: unsafe { ctrl_ptr.add(nb_slot) as *mut u64 },
             },
             batching: HashSetBatching {
                 temp_modif_hashmap: HashMap::new(),
@@ -101,7 +130,7 @@ impl HashSet {
 
     pub async fn from_file(directory_path: &Path) -> io::Result<Self> {
         let data_file_path = Path::new(directory_path).join("data.bin");
-        let data_file = OpenOptions::new()
+        let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(data_file_path)
@@ -114,13 +143,15 @@ impl HashSet {
             .open(journal_file_path)
             .await?;
 
-        let data_file_len = data_file.metadata().await?.len() as usize;
-        let nb_slot = data_file_len / (1 + size_of::<u64>());
-        let nb_group = data_file_len / NB_KEY_IN_EACH_GROUP;
-        let degree = nb_group.trailing_zeros();
+        let mut config_bytes = [0u8; CONFIG_SIZE];
+        data_file.read_exact(&mut config_bytes).await.unwrap();
+        let config = HashSetConfig::read_from_bytes(&config_bytes).unwrap();
+
+        let nb_group = 2usize.pow(config.degree as u32);
+        let nb_slot = nb_group * NB_KEY_IN_EACH_GROUP;
 
         let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
-        let data_file_mmap_ptr = data_file_mmap.as_mut_ptr();
+        let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
 
         /*let mut journal_read_buf = vec![0u8; 16 * 1024].into_boxed_slice();
         loop {
@@ -137,12 +168,12 @@ impl HashSet {
             data_file,
             journal_file,
             data_file_mmap,
-            h1_shift: 64 - degree as usize,
+            h1_shift: 64 - config.degree as usize,
             nb_group,
             nb_slot,
             ptr: HashSetPtr {
-                ctrl: data_file_mmap_ptr,
-                key: unsafe { data_file_mmap_ptr.add(nb_slot) as *mut u64 },
+                ctrl: ctrl_ptr,
+                key: unsafe { ctrl_ptr.add(nb_slot) as *mut u64 },
             },
             batching: HashSetBatching {
                 temp_modif_hashmap: HashMap::with_capacity(512),
