@@ -112,11 +112,11 @@ impl HashSet {
             h1_shift: 64 - degree as usize,
             nb_group,
             nb_slot,
-            ptr: HashSetPtr {
+            ptr: Ptr {
                 ctrl: ctrl_ptr,
                 key: key_ptr,
             },
-            batching_data: HashSetBatching {
+            batching_data: BatchingData {
                 temp_modif_hashmap: HashMap::new(),
                 batch_insert_result: Vec::with_capacity(512),
                 journal_log: Vec::with_capacity(512),
