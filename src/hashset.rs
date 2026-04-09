@@ -4,7 +4,6 @@ use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::ptr;
-use std::time::Instant;
 use std::{io, path::Path};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -54,10 +53,12 @@ struct HashSetPtr {
 struct HashSetBatching {
     temp_modif_hashmap: HashMap<usize, TempModifGroup>,
     batch_insert_result: Vec<bool>,
-    journal_log: Vec<u8>,
+    journal_log: Vec<HashSetJournalLog>,
 }
 
-struct HashSetJournalLine {
+#[derive(Immutable, IntoBytes, FromBytes)]
+#[repr(C, packed)]
+struct HashSetJournalLog {
     slot_id: u64,
     key: u64,
 }
@@ -84,16 +85,15 @@ impl HashSet {
         let nb_slot = nb_group * NB_KEY_IN_EACH_GROUP;
 
         data_file
-            .set_len((nb_slot * (1 + size_of::<u64>())) as u64)
+            .set_len(ALIGNED_CONFIG_SIZE as u64 + (nb_slot * (1 + size_of::<u64>())) as u64)
             .await?;
-        journal_file.set_len(1_000_000).await?;
 
         let config = HashSetConfig { degree };
         data_file.write_all(config.as_bytes()).await.unwrap();
         data_file
             .seek(SeekFrom::Start(ALIGNED_CONFIG_SIZE as u64))
             .await
-            .unwrap(); //cache friendly for mmap
+            .unwrap();
 
         let write_buf = vec![EMPTY_FLAG; 8 * 1024].into_boxed_slice();
         for i in 0..(nb_slot / (8 * 1024)) {
@@ -108,6 +108,7 @@ impl HashSet {
 
         let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
         let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
+        let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
 
         Ok(Self {
             data_file,
@@ -118,7 +119,7 @@ impl HashSet {
             nb_slot,
             ptr: HashSetPtr {
                 ctrl: ctrl_ptr,
-                key: unsafe { ctrl_ptr.add(nb_slot) as *mut u64 },
+                key: key_ptr,
             },
             batching: HashSetBatching {
                 temp_modif_hashmap: HashMap::new(),
@@ -137,7 +138,7 @@ impl HashSet {
             .await?;
 
         let journal_file_path = Path::new(directory_path).join("journal.bin");
-        let journal_file = OpenOptions::new()
+        let mut journal_file = OpenOptions::new()
             .read(true)
             .append(true)
             .open(journal_file_path)
@@ -152,17 +153,32 @@ impl HashSet {
 
         let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
         let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
+        let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
 
-        /*let mut journal_read_buf = vec![0u8; 16 * 1024].into_boxed_slice();
+        let mut journal_read_buf = vec![0u8; 8 * 1024].into_boxed_slice();
         loop {
             let read_size = journal_file.read(&mut journal_read_buf).await?;
+            let read_slice = &journal_read_buf[..read_size];
 
-            for _ in 0..read_size / 16 {}
+            let mut read_idx = 0;
+            for _ in 0..(read_size / 16) {
+                let journal_log =
+                    HashSetJournalLog::read_from_bytes(&read_slice[read_idx..(read_idx + 16)])
+                        .unwrap();
 
-            if read_size != 16 * 1024 {
+                unsafe {
+                    *ctrl_ptr.add(journal_log.slot_id as usize) =
+                        (xxh3_64(&journal_log.key.to_be_bytes()) & 0b01_11_11_11) as u8;
+                    *key_ptr.add(journal_log.slot_id as usize) = journal_log.key;
+                }
+
+                read_idx += 16;
+            }
+
+            if read_size < 8 * 1024 {
                 break;
             }
-        }*/
+        }
 
         Ok(Self {
             data_file,
@@ -173,7 +189,7 @@ impl HashSet {
             nb_slot,
             ptr: HashSetPtr {
                 ctrl: ctrl_ptr,
-                key: unsafe { ctrl_ptr.add(nb_slot) as *mut u64 },
+                key: key_ptr,
             },
             batching: HashSetBatching {
                 temp_modif_hashmap: HashMap::with_capacity(512),
@@ -246,12 +262,13 @@ impl HashSet {
 
         let selected_slot = selected_slot_opt.unwrap(); //safe unwrap
 
-        let mut journal_line_data = [0u8; 8 * 2];
-        journal_line_data.as_mut_slice()[0..8].clone_from_slice(&selected_slot.to_be_bytes()); //slot id
-        journal_line_data.as_mut_slice()[8..16].clone_from_slice(&key.to_be_bytes()); //value
+        let journal_log = HashSetJournalLog {
+            slot_id: selected_slot as u64,
+            key,
+        };
 
         self.journal_file
-            .write_all(&journal_line_data)
+            .write_all(journal_log.as_bytes())
             .await
             .unwrap();
         self.journal_file.sync_all().await.unwrap();
@@ -276,7 +293,7 @@ impl HashSet {
 
         //add journal logs
         self.journal_file
-            .write_all(&self.batching.journal_log)
+            .write_all(self.batching.journal_log.as_bytes())
             .await
             .unwrap();
         self.journal_file.sync_all().await.unwrap();
@@ -304,7 +321,7 @@ impl HashSet {
         let key_hash = xxh3_64(&key.to_be_bytes()) as usize;
         let h2: u8 = key_hash as u8 & 0b01_11_11_11;
 
-        let mut selected_slot_opt: Option<(Either<usize, GroupPtr>, u8)> = None;
+        let mut selected_slot_opt: Option<(usize, Either<usize, GroupPtr>, u8)> = None;
 
         let mut group_id = key_hash >> self.h1_shift;
         let mut nb_probing = 0;
@@ -353,11 +370,17 @@ impl HashSet {
                     }
                     .trailing_zeros() as usize;
                     if is_on_mmap {
-                        selected_slot_opt =
-                            Some((Either::Left(group_id), key_index_in_group as u8));
+                        selected_slot_opt = Some((
+                            group_id * 16 + key_index_in_group as usize,
+                            Either::Left(group_id),
+                            key_index_in_group as u8,
+                        ));
                     } else {
-                        selected_slot_opt =
-                            Some((Either::Right(group_ptr), key_index_in_group as u8));
+                        selected_slot_opt = Some((
+                            group_id * 16 + key_index_in_group as usize,
+                            Either::Right(group_ptr),
+                            key_index_in_group as u8,
+                        ));
                     }
                 }
                 break;
@@ -368,11 +391,17 @@ impl HashSet {
                 if delete_mask != 0 {
                     let key_index_in_group = delete_mask.trailing_zeros();
                     if is_on_mmap {
-                        selected_slot_opt =
-                            Some((Either::Left(group_id), key_index_in_group as u8));
+                        selected_slot_opt = Some((
+                            group_id * 16 + key_index_in_group as usize,
+                            Either::Left(group_id),
+                            key_index_in_group as u8,
+                        ));
                     } else {
-                        selected_slot_opt =
-                            Some((Either::Right(group_ptr), key_index_in_group as u8));
+                        selected_slot_opt = Some((
+                            group_id * 16 + key_index_in_group as usize,
+                            Either::Right(group_ptr),
+                            key_index_in_group as u8,
+                        ));
                     }
                 }
             }
@@ -384,7 +413,7 @@ impl HashSet {
             }
         }
 
-        let (group, slot_idx_in_group) = selected_slot_opt.unwrap(); //safe unwrap
+        let (slot_id, group, slot_idx_in_group) = selected_slot_opt.unwrap(); //safe unwrap
         match group {
             Either::Left(selected_group_id) => {
                 let mut ctrl_slice = [0u8; NB_KEY_IN_EACH_GROUP];
@@ -417,7 +446,10 @@ impl HashSet {
             },
         }
 
-        self.batching.journal_log.extend_from_slice(&[0u8; 16]);
+        self.batching.journal_log.push(HashSetJournalLog {
+            slot_id: slot_id as u64,
+            key,
+        });
 
         true
     }
