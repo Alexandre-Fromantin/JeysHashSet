@@ -15,6 +15,17 @@ const EMPTY_FLAG: u8 = 0xFF;
 
 const NB_KEY_IN_EACH_GROUP: usize = 16;
 
+pub struct HashSet {
+    data_file: File,
+    journal_file: File,
+    data_file_mmap: MmapMut,
+    h1_shift: usize,
+    nb_group: usize,
+    nb_slot: usize,
+    ptr: Ptr,
+    batching_data: BatchingData,
+}
+
 #[derive(IntoBytes, FromBytes, Immutable)]
 #[repr(C)]
 struct HashSetConfig {
@@ -24,43 +35,27 @@ struct HashSetConfig {
 const CONFIG_SIZE: usize = size_of::<HashSetConfig>();
 const ALIGNED_CONFIG_SIZE: usize = CONFIG_SIZE + (64 - CONFIG_SIZE % 64); //cache friendly
 
-struct TempModifGroup {
+struct Ptr {
+    ctrl: *mut u8,
+    key: *mut u64,
+}
+
+struct TemporaryModificationGroup {
     ctrl: [u8; NB_KEY_IN_EACH_GROUP],
     key: [u64; NB_KEY_IN_EACH_GROUP],
 }
 
-struct GroupPtr {
-    ctrl: *mut u8,
-    key: *mut u64,
-}
-
-pub struct HashSet {
-    data_file: File,
-    journal_file: File,
-    data_file_mmap: MmapMut,
-    h1_shift: usize,
-    nb_group: usize,
-    nb_slot: usize,
-    ptr: HashSetPtr,
-    batching: HashSetBatching,
-}
-
-struct HashSetPtr {
-    ctrl: *mut u8,
-    key: *mut u64,
-}
-
-struct HashSetBatching {
-    temp_modif_hashmap: HashMap<usize, TempModifGroup>,
-    batch_insert_result: Vec<bool>,
-    journal_log: Vec<HashSetJournalLog>,
-}
-
 #[derive(Immutable, IntoBytes, FromBytes)]
 #[repr(C, packed)]
-struct HashSetJournalLog {
+struct JournalLog {
     slot_id: u64,
     key: u64,
+}
+
+struct BatchingData {
+    temp_modif_hashmap: HashMap<usize, TemporaryModificationGroup>,
+    batch_insert_result: Vec<bool>,
+    journal_log: Vec<JournalLog>,
 }
 
 impl HashSet {
@@ -121,7 +116,7 @@ impl HashSet {
                 ctrl: ctrl_ptr,
                 key: key_ptr,
             },
-            batching: HashSetBatching {
+            batching_data: HashSetBatching {
                 temp_modif_hashmap: HashMap::new(),
                 batch_insert_result: Vec::with_capacity(512),
                 journal_log: Vec::with_capacity(512),
@@ -163,8 +158,7 @@ impl HashSet {
             let mut read_idx = 0;
             for _ in 0..(read_size / 16) {
                 let journal_log =
-                    HashSetJournalLog::read_from_bytes(&read_slice[read_idx..(read_idx + 16)])
-                        .unwrap();
+                    JournalLog::read_from_bytes(&read_slice[read_idx..(read_idx + 16)]).unwrap();
 
                 unsafe {
                     *ctrl_ptr.add(journal_log.slot_id as usize) =
@@ -187,11 +181,11 @@ impl HashSet {
             h1_shift: 64 - config.degree as usize,
             nb_group,
             nb_slot,
-            ptr: HashSetPtr {
+            ptr: Ptr {
                 ctrl: ctrl_ptr,
                 key: key_ptr,
             },
-            batching: HashSetBatching {
+            batching_data: BatchingData {
                 temp_modif_hashmap: HashMap::with_capacity(512),
                 batch_insert_result: Vec::with_capacity(512),
                 journal_log: Vec::with_capacity(512),
@@ -262,7 +256,7 @@ impl HashSet {
 
         let selected_slot = selected_slot_opt.unwrap(); //safe unwrap
 
-        let journal_log = HashSetJournalLog {
+        let journal_log = JournalLog {
             slot_id: selected_slot as u64,
             key,
         };
@@ -282,24 +276,24 @@ impl HashSet {
     }
 
     pub async fn batch_insert(&mut self, list_key: &[u64]) -> &[bool] {
-        self.batching.temp_modif_hashmap.clear();
-        self.batching.batch_insert_result.clear();
-        self.batching.journal_log.clear();
+        self.batching_data.temp_modif_hashmap.clear();
+        self.batching_data.batch_insert_result.clear();
+        self.batching_data.journal_log.clear();
 
         for key in list_key {
             let success = self.batch_insert_one_key(*key).await;
-            self.batching.batch_insert_result.push(success);
+            self.batching_data.batch_insert_result.push(success);
         }
 
         //add journal logs
         self.journal_file
-            .write_all(self.batching.journal_log.as_bytes())
+            .write_all(self.batching_data.journal_log.as_bytes())
             .await
             .unwrap();
         self.journal_file.sync_all().await.unwrap();
 
         //update file mmap
-        for (&group_id, modif) in &self.batching.temp_modif_hashmap {
+        for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
             unsafe {
                 ptr::copy_nonoverlapping(
                     modif.ctrl.as_ptr(),
@@ -314,22 +308,25 @@ impl HashSet {
             }
         }
 
-        &self.batching.batch_insert_result
+        &self.batching_data.batch_insert_result
     }
 
     async fn batch_insert_one_key(&mut self, key: u64) -> bool {
         let key_hash = xxh3_64(&key.to_be_bytes()) as usize;
         let h2: u8 = key_hash as u8 & 0b01_11_11_11;
 
-        let mut selected_slot_opt: Option<(usize, Either<usize, GroupPtr>, u8)> = None;
+        let mut selected_slot_opt: Option<(usize, Either<usize, Ptr>, u8)> = None;
 
         let mut group_id = key_hash >> self.h1_shift;
         let mut nb_probing = 0;
         loop {
-            let (is_on_mmap, group_ptr) =
-                self.batching.temp_modif_hashmap.get_mut(&group_id).map_or(
+            let (is_on_mmap, group_ptr) = self
+                .batching_data
+                .temp_modif_hashmap
+                .get_mut(&group_id)
+                .map_or(
                     (true, unsafe {
-                        GroupPtr {
+                        Ptr {
                             ctrl: self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP),
                             key: self.ptr.key.add(group_id * NB_KEY_IN_EACH_GROUP),
                         }
@@ -337,7 +334,7 @@ impl HashSet {
                     |temp_group| {
                         (
                             false,
-                            GroupPtr {
+                            Ptr {
                                 ctrl: temp_group.ctrl.as_mut_ptr(),
                                 key: temp_group.key.as_mut_ptr(),
                             },
@@ -432,9 +429,9 @@ impl HashSet {
                 }
                 ctrl_slice[slot_idx_in_group as usize] = h2;
                 key_slice[slot_idx_in_group as usize] = key;
-                self.batching.temp_modif_hashmap.insert(
+                self.batching_data.temp_modif_hashmap.insert(
                     selected_group_id,
-                    TempModifGroup {
+                    TemporaryModificationGroup {
                         ctrl: ctrl_slice,
                         key: key_slice,
                     },
@@ -446,7 +443,7 @@ impl HashSet {
             },
         }
 
-        self.batching.journal_log.push(HashSetJournalLog {
+        self.batching_data.journal_log.push(JournalLog {
             slot_id: slot_id as u64,
             key,
         });
