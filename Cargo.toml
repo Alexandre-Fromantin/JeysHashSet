@@ -1,5 +1,5 @@
 [package]
-name = "JeysHashSet"
+name = "jeys_hash_set"
 version = "0.1.0"
 edition = "2024"
 authors = ["Alexandre Fromantin <alexandre.fromantin08@gmail.com@gmail.com>"]
