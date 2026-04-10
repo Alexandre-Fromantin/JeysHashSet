@@ -10,7 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::journal::{JournalLog, JournalManager};
+mod journal;
+use journal::{JournalLog, JournalManager};
 
 const DELETE_FLAG: u8 = 0xFE;
 const EMPTY_FLAG: u8 = 0xFF;

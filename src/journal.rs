@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, LittleEndian, U32, U64};
 
-use crate::hashset::HashSetPtr;
+use crate::HashSetPtr;
 
 #[derive(Immutable, IntoBytes, FromBytes)]
 #[repr(C)]
