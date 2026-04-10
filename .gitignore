@@ -1,8 +1,10 @@
 # Build directory
 /target
+/examples/target
 
 # Directory for data test
 /data
+/examples/data
 
 # Draw.io temp/backup file
 *.bkp

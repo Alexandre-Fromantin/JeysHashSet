@@ -1,0 +1,8 @@
+[package]
+name = "jeys_hash_set_examples"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jeys_hash_set = {path = "../"}
+tokio = "1.51.1"
