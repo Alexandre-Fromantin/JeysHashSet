@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "HashSet"
+name = "JeysHashSet"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
