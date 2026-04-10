@@ -30,8 +30,6 @@ const JOURNAL_HEADER_SIZE: usize = size_of::<JournalHeader>();
 type IntergrityCheckType = U32<LittleEndian>;
 const INTEGRITY_CHECK_SIZE: usize = size_of::<IntergrityCheckType>();
 
-const MAX_LOG_IN_ONE_TIME: usize = 512;
-
 pub struct JournalManager {
     journal_file: File,
     nb_log: u32,
