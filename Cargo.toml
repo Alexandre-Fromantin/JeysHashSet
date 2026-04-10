@@ -17,8 +17,8 @@ zerocopy = { version = "0.8.48", features = ["derive"] }
 
 [dependencies.xxhash-rust]
 version = "0.8.15"
-features = ["xxh3", "xxh64", "xxh32"]
+features = ["xxh3"]
 
 [[bench]]
-name = "hash"
+name = "xxhash"
 harness = false
