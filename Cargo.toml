@@ -8,7 +8,6 @@ repository = "https://github.com/Alexandre-Fromantin/JeysHashSet"
 
 [dependencies]
 crc32fast = "1.5.0"
-either = "1.15.0"
 memmap2 = "0.9.10"
 tokio = { version = "1.51.0", features = ["full"] }
 tracing = "0.1.44"

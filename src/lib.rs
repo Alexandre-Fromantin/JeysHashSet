@@ -1,4 +1,3 @@
-use either::Either;
 use memmap2::MmapMut;
 use std::arch::x86_64::*;
 use std::collections::HashMap;
@@ -52,6 +51,17 @@ struct TemporaryModificationGroup {
 struct BatchingData {
     temp_modif_hashmap: HashMap<usize, TemporaryModificationGroup>,
     batch_insert_result: Vec<bool>,
+}
+
+struct BatchingSelectedSlot {
+    slot_id: usize,
+    group: BatchingGroup,
+    key_index_in_group: u8,
+}
+
+enum BatchingGroup {
+    OnlyRead { group_id: usize },
+    ReadWrite { ptr: HashSetPtr },
 }
 
 impl HashSet {
@@ -266,7 +276,7 @@ impl HashSet {
         let key_hash = xxh3_64(&key.to_le_bytes()) as usize;
         let h2: u8 = key_hash as u8 & 0b01_11_11_11;
 
-        let mut selected_slot_opt: Option<(usize, Either<usize, HashSetPtr>, u8)> = None;
+        let mut selected_slot_opt: Option<BatchingSelectedSlot> = None;
 
         let mut group_id = key_hash >> self.h1_shift;
         let mut nb_probing = 0;
@@ -316,19 +326,19 @@ impl HashSet {
                     } else {
                         empty_mask
                     }
-                    .trailing_zeros() as usize;
+                    .trailing_zeros() as u8;
                     if is_on_mmap {
-                        selected_slot_opt = Some((
-                            group_id * 16 + key_index_in_group as usize,
-                            Either::Left(group_id),
-                            key_index_in_group as u8,
-                        ));
+                        selected_slot_opt = Some(BatchingSelectedSlot {
+                            slot_id: group_id * 16 + key_index_in_group as usize,
+                            group: BatchingGroup::OnlyRead { group_id },
+                            key_index_in_group,
+                        });
                     } else {
-                        selected_slot_opt = Some((
-                            group_id * 16 + key_index_in_group as usize,
-                            Either::Right(group_ptr),
-                            key_index_in_group as u8,
-                        ));
+                        selected_slot_opt = Some(BatchingSelectedSlot {
+                            slot_id: group_id * 16 + key_index_in_group as usize,
+                            group: BatchingGroup::ReadWrite { ptr: group_ptr },
+                            key_index_in_group,
+                        });
                     }
                 }
                 break;
@@ -337,19 +347,19 @@ impl HashSet {
             if selected_slot_opt.is_none() {
                 let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
                 if delete_mask != 0 {
-                    let key_index_in_group = delete_mask.trailing_zeros();
+                    let key_index_in_group = delete_mask.trailing_zeros() as u8;
                     if is_on_mmap {
-                        selected_slot_opt = Some((
-                            group_id * 16 + key_index_in_group as usize,
-                            Either::Left(group_id),
-                            key_index_in_group as u8,
-                        ));
+                        selected_slot_opt = Some(BatchingSelectedSlot {
+                            slot_id: group_id * 16 + key_index_in_group as usize,
+                            group: BatchingGroup::OnlyRead { group_id },
+                            key_index_in_group,
+                        });
                     } else {
-                        selected_slot_opt = Some((
-                            group_id * 16 + key_index_in_group as usize,
-                            Either::Right(group_ptr),
-                            key_index_in_group as u8,
-                        ));
+                        selected_slot_opt = Some(BatchingSelectedSlot {
+                            slot_id: group_id * 16 + key_index_in_group as usize,
+                            group: BatchingGroup::ReadWrite { ptr: group_ptr },
+                            key_index_in_group,
+                        });
                     }
                 }
             }
@@ -361,9 +371,9 @@ impl HashSet {
             }
         }
 
-        let (slot_id, group, slot_idx_in_group) = selected_slot_opt.unwrap(); //safe unwrap
-        match group {
-            Either::Left(selected_group_id) => {
+        let selected_slot = selected_slot_opt.unwrap(); //safe unwrap
+        match selected_slot.group {
+            BatchingGroup::OnlyRead { group_id } => {
                 let mut ctrl_slice = [0u8; NB_KEY_IN_EACH_GROUP];
                 let mut key_slice = [0u64; NB_KEY_IN_EACH_GROUP];
                 unsafe {
@@ -378,24 +388,26 @@ impl HashSet {
                         NB_KEY_IN_EACH_GROUP,
                     );
                 }
-                ctrl_slice[slot_idx_in_group as usize] = h2;
-                key_slice[slot_idx_in_group as usize] = key;
+                ctrl_slice[selected_slot.key_index_in_group as usize] = h2;
+                key_slice[selected_slot.key_index_in_group as usize] = key;
                 self.batching_data.temp_modif_hashmap.insert(
-                    selected_group_id,
+                    group_id,
                     TemporaryModificationGroup {
                         ctrl: ctrl_slice,
                         key: key_slice,
                     },
                 );
             }
-            Either::Right(group_ptr) => unsafe {
-                *group_ptr.ctrl.add(slot_idx_in_group as usize) = h2;
-                *group_ptr.key.add(slot_idx_in_group as usize) = key;
+            BatchingGroup::ReadWrite { ptr: group_ptr } => unsafe {
+                *group_ptr
+                    .ctrl
+                    .add(selected_slot.key_index_in_group as usize) = h2;
+                *group_ptr.key.add(selected_slot.key_index_in_group as usize) = key;
             },
         }
 
         self.journal_manager.add_log(JournalLog {
-            slot_id: (slot_id as u64).into(),
+            slot_id: (selected_slot.slot_id as u64).into(),
             key: key.into(),
         });
 
