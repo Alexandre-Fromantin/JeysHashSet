@@ -48,9 +48,22 @@ struct TemporaryModificationGroup {
     key: [u64; NB_KEY_IN_EACH_GROUP],
 }
 
+#[derive(Clone, Copy)]
+pub struct BatchingParameter {
+    pub pre_allocated_size: usize,
+}
+
 struct BatchingData {
     temp_modif_hashmap: HashMap<usize, TemporaryModificationGroup>,
     batch_insert_result: Vec<bool>,
+}
+impl BatchingData {
+    fn from_param(param: BatchingParameter) -> Self {
+        Self {
+            temp_modif_hashmap: HashMap::with_capacity(param.pre_allocated_size * 2),
+            batch_insert_result: Vec::with_capacity(param.pre_allocated_size),
+        }
+    }
 }
 
 struct BatchingSelectedSlot {
@@ -65,7 +78,11 @@ enum BatchingGroup {
 }
 
 impl HashSet {
-    pub async fn new(directory_path: &Path, degree: u8) -> io::Result<Self> {
+    pub async fn new(
+        directory_path: &Path,
+        degree: u8,
+        batching_param: BatchingParameter,
+    ) -> io::Result<Self> {
         let data_file_path = Path::new(directory_path).join("data.bin");
         let mut data_file = OpenOptions::new()
             .read(true)
@@ -116,14 +133,14 @@ impl HashSet {
             nb_group,
             nb_slot,
             journal_manager,
-            batching_data: BatchingData {
-                temp_modif_hashmap: HashMap::new(),
-                batch_insert_result: Vec::with_capacity(512),
-            },
+            batching_data: BatchingData::from_param(batching_param),
         })
     }
 
-    pub async fn from_file(directory_path: &Path) -> io::Result<Self> {
+    pub async fn from_file(
+        directory_path: &Path,
+        batching_param: BatchingParameter,
+    ) -> io::Result<Self> {
         let data_file_path = Path::new(directory_path).join("data.bin");
         let mut data_file = OpenOptions::new()
             .read(true)
@@ -158,10 +175,7 @@ impl HashSet {
             nb_group,
             nb_slot,
             journal_manager,
-            batching_data: BatchingData {
-                temp_modif_hashmap: HashMap::with_capacity(512),
-                batch_insert_result: Vec::with_capacity(512),
-            },
+            batching_data: BatchingData::from_param(batching_param),
         })
     }
 

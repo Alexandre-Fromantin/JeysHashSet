@@ -1,13 +1,19 @@
 use std::{path::Path, time::Instant};
 
-use jeys_hash_set::HashSet;
+use jeys_hash_set::{BatchingParameter, HashSet};
 use tokio::{fs::remove_file, io};
 
 const DEGREE: u8 = 20;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let mut hash_set: HashSet = HashSet::new(Path::new("data"), DEGREE).await.unwrap();
+    let batching_param = BatchingParameter {
+        pre_allocated_size: 512,
+    };
+
+    let mut hash_set: HashSet = HashSet::new(Path::new("data"), DEGREE, batching_param)
+        .await
+        .unwrap();
 
     let chunk_size: u32 = 2u32.pow(9);
 
@@ -32,7 +38,9 @@ async fn main() -> io::Result<()> {
     drop(hash_set);
 
     let time = Instant::now();
-    let mut hash_set2: HashSet = HashSet::from_file(Path::new("data")).await.unwrap();
+    let mut hash_set2: HashSet = HashSet::from_file(Path::new("data"), batching_param)
+        .await
+        .unwrap();
     println!("time {:?}", time.elapsed());
 
     remove_file("data/data.bin").await;
