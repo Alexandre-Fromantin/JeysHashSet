@@ -2,11 +2,21 @@ use std::{path::Path, time::Instant};
 
 use jeys_hash_set::{BatchingParameter, HashSet};
 use tokio::{fs::remove_file, io};
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
 
 const DEGREE: u8 = 20;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    remove_file("data/data.bin").await?;
+    remove_file("data/journal.bin").await?;
+
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::TRACE)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
     let batching_param = BatchingParameter {
         pre_allocated_size: 512,
     };
@@ -38,13 +48,10 @@ async fn main() -> io::Result<()> {
     drop(hash_set);
 
     let time = Instant::now();
-    let mut hash_set2: HashSet = HashSet::from_file(Path::new("data"), batching_param)
+    let hash_set2: HashSet = HashSet::from_file(Path::new("data"), batching_param)
         .await
         .unwrap();
     println!("time {:?}", time.elapsed());
-
-    remove_file("data/data.bin").await;
-    remove_file("data/journal.bin").await;
 
     Ok(())
 }

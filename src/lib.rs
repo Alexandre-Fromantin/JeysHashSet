@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+mod direct_file;
 mod journal;
 use journal::{JournalLog, JournalManager};
 
@@ -106,7 +107,7 @@ impl HashSet {
             .unwrap();
 
         let write_buf = vec![EMPTY_FLAG; 8 * 1024].into_boxed_slice();
-        for i in 0..(nb_slot / (8 * 1024)) {
+        for _ in 0..(nb_slot / (8 * 1024)) {
             data_file.write_all(&write_buf).await.unwrap();
         }
         data_file
@@ -120,7 +121,7 @@ impl HashSet {
         let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
         let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
 
-        let journal_manager = JournalManager::new(directory_path, 512).await?;
+        let journal_manager = JournalManager::new(directory_path).await?;
 
         Ok(Self {
             data_file,
@@ -163,7 +164,7 @@ impl HashSet {
             key: key_ptr,
         };
 
-        let journal_manager = JournalManager::from_file(directory_path, 512, data_ptr)
+        let journal_manager = JournalManager::from_file(directory_path, data_ptr)
             .await
             .unwrap();
 
@@ -246,7 +247,7 @@ impl HashSet {
             slot_id: (selected_slot as u64).into(),
             key: key.into(),
         });
-        self.journal_manager.finalize().await;
+        self.journal_manager.finalize().await.unwrap();
 
         unsafe {
             *self.ptr.ctrl.add(selected_slot) = h2;
@@ -265,7 +266,7 @@ impl HashSet {
             self.batching_data.batch_insert_result.push(success);
         }
 
-        self.journal_manager.finalize().await;
+        self.journal_manager.finalize().await.unwrap();
 
         //update file mmap
         for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
