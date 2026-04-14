@@ -7,7 +7,6 @@ use tokio::{
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 use tracing::debug;
-use windows::Win32::Storage::FileSystem;
 
 const SECTOR_SIZE: usize = 4096;
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
@@ -21,19 +20,8 @@ pub struct DirectFile {
 }
 
 impl DirectFile {
-    #[cfg(target_os = "windows")]
     pub async fn new(file_path: &Path, nb_sectors_allocated: usize) -> io::Result<Self> {
-        use ::windows::Win32::Storage::FileSystem;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .custom_flags(
-                FileSystem::FILE_FLAG_NO_BUFFERING.0 | FileSystem::FILE_FLAG_WRITE_THROUGH.0,
-            )
-            .open(&file_path)
-            .await?;
+        let file = open_file_without_os_cache_and_write_sync(file_path, true).await?;
 
         let mut buffer_vec: AVec<u8, ConstAlign<SECTOR_SIZE>> = AVec::with_capacity(SECTOR_SIZE, 0);
         buffer_vec.resize(SECTOR_SIZE * nb_sectors_allocated, 0);
@@ -48,20 +36,12 @@ impl DirectFile {
         })
     }
 
-    #[cfg(target_os = "windows")]
     pub async fn from_file(
         file_path: &Path,
         nb_sectors_allocated: usize,
         start_idx: usize,
     ) -> io::Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(
-                FileSystem::FILE_FLAG_NO_BUFFERING.0 | FileSystem::FILE_FLAG_WRITE_THROUGH.0,
-            )
-            .open(&file_path)
-            .await?;
+        let mut file = open_file_without_os_cache_and_write_sync(file_path, false).await?;
 
         let mut buffer_vec: AVec<u8, ConstAlign<SECTOR_SIZE>> = AVec::with_capacity(SECTOR_SIZE, 0);
         buffer_vec.resize(SECTOR_SIZE * nb_sectors_allocated, 0);
@@ -162,4 +142,36 @@ impl Drop for DirectFile {
     fn drop(&mut self) {
         unsafe { ManuallyDrop::drop(&mut self.buffer) };
     }
+}
+
+#[cfg(target_os = "windows")]
+async fn open_file_without_os_cache_and_write_sync(
+    file_path: &Path,
+    new_file: bool,
+) -> io::Result<File> {
+    use windows::Win32::Storage::FileSystem;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(new_file)
+        .custom_flags((FileSystem::FILE_FLAG_NO_BUFFERING | FileSystem::FILE_FLAG_WRITE_THROUGH).0)
+        .open(file_path)
+        .await
+}
+
+#[cfg(target_os = "linux")]
+async fn open_file_without_os_cache_and_write_sync(
+    file_path: &Path,
+    new_file: bool,
+) -> io::Result<File> {
+    use nix::fcntl::OFlag;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(new_file)
+        .custom_flags((OFlag::O_SYNC | OFlag::O_DIRECT).bits())
+        .open(file_path)
+        .await
 }

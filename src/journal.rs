@@ -1,9 +1,9 @@
-use std::{fs::read, path::Path};
+use std::path::Path;
 
 use crc32fast as crc32;
-use memmap2::{Mmap, MmapMut};
+use memmap2::Mmap;
 use tokio::{fs::OpenOptions, io};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, LittleEndian, U32, U64};
 
