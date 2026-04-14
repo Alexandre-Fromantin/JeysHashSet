@@ -121,7 +121,7 @@ impl HashSet {
         let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
         let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
 
-        let journal_manager = JournalManager::new(directory_path).await?;
+        let journal_manager = JournalManager::new(directory_path, batching_param).await?;
 
         Ok(Self {
             data_file,
@@ -164,7 +164,7 @@ impl HashSet {
             key: key_ptr,
         };
 
-        let journal_manager = JournalManager::from_file(directory_path, data_ptr)
+        let journal_manager = JournalManager::from_file(directory_path, data_ptr, batching_param)
             .await
             .unwrap();
 

@@ -8,8 +8,8 @@ use tokio::{
 };
 use tracing::debug;
 
-const SECTOR_SIZE: usize = 4096;
-const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
+pub const SECTOR_SIZE: usize = 4096;
+pub const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
 
 pub struct DirectFile {
     file: File,
@@ -68,7 +68,7 @@ impl DirectFile {
         self.check_enough_space(slice.len());
 
         self.buffer[self.write_idx..(self.write_idx + slice.len())].copy_from_slice(slice);
-        self.write_idx += slice.len()
+        self.write_idx += slice.len();
     }
 
     pub fn skip(&mut self, n: usize) {
@@ -81,7 +81,7 @@ impl DirectFile {
     }
 
     fn check_enough_space(&mut self, space_needed: usize) {
-        if self.remaining_free_space() < self.write_idx {
+        if self.remaining_free_space() < space_needed {
             //not enough space
             debug!("not enough space in write buffer");
             self.add_n_sector(ceil(space_needed as f64 / 4096.0) as usize);

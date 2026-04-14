@@ -1,13 +1,17 @@
 use std::path::Path;
 
 use crc32fast as crc32;
+use libm::ceil;
 use memmap2::Mmap;
 use tokio::{fs::OpenOptions, io};
 use tracing::{info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, LittleEndian, U32, U64};
 
-use crate::{HashSetPtr, direct_file::DirectFile};
+use crate::{
+    BatchingParameter, HashSetPtr,
+    direct_file::{DirectFile, SECTOR_SIZE},
+};
 
 #[derive(Immutable, IntoBytes, FromBytes)]
 #[repr(C)]
@@ -33,9 +37,13 @@ pub struct JournalManager {
 }
 
 impl JournalManager {
-    pub async fn new(directory_path: &Path) -> io::Result<Self> {
+    pub async fn new(directory_path: &Path, batching_param: BatchingParameter) -> io::Result<Self> {
         let journal_file_path = Path::new(directory_path).join("journal.bin");
-        let mut journal_file = DirectFile::new(&journal_file_path, 4).await?;
+        let mut journal_file = DirectFile::new(
+            &journal_file_path,
+            nb_allocated_sector_for_batching_param(batching_param),
+        )
+        .await?;
         journal_file.skip(JOURNAL_HEADER_SIZE);
 
         Ok(Self {
@@ -44,7 +52,11 @@ impl JournalManager {
         })
     }
 
-    pub async fn from_file(directory_path: &Path, hash_set_ptr: HashSetPtr) -> io::Result<Self> {
+    pub async fn from_file(
+        directory_path: &Path,
+        hash_set_ptr: HashSetPtr,
+        batching_param: BatchingParameter,
+    ) -> io::Result<Self> {
         let journal_file_path = Path::new(directory_path).join("journal.bin");
         let check_result = check_journal_file(&journal_file_path, hash_set_ptr).await?;
 
@@ -63,11 +75,21 @@ impl JournalManager {
                     check_result.end_file_idx
                 );
             }
-            DirectFile::from_file(&journal_file_path, 4, check_result.end_file_idx).await?
+            DirectFile::from_file(
+                &journal_file_path,
+                nb_allocated_sector_for_batching_param(batching_param),
+                check_result.end_file_idx,
+            )
+            .await?
         } else {
             info!("Journal file does not bring any change");
             info!("Empty the journal file");
-            DirectFile::from_file(&journal_file_path, 4, 0).await?
+            DirectFile::from_file(
+                &journal_file_path,
+                nb_allocated_sector_for_batching_param(batching_param),
+                0,
+            )
+            .await?
         };
         journal_file.skip(JOURNAL_HEADER_SIZE); //reserve header space
 
@@ -203,4 +225,14 @@ async fn check_journal_file(
         file_corrupted,
         end_file_idx: read_idx,
     })
+}
+
+fn nb_allocated_sector_for_batching_param(batching_param: BatchingParameter) -> usize {
+    ceil(
+        (JOURNAL_HEADER_SIZE
+            + batching_param.pre_allocated_size * JOURNAL_LOG_SIZE
+            + INTEGRITY_CHECK_SIZE) as f64
+            / SECTOR_SIZE as f64,
+    ) as usize
+        + 1
 }
