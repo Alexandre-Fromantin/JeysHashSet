@@ -136,6 +136,10 @@ impl DirectFile {
             Ok(())
         }
     }
+
+    pub fn file_size(&self) -> u64 {
+        (self.start_sector + 1) * SECTOR_SIZE_U64
+    }
 }
 
 impl Drop for DirectFile {

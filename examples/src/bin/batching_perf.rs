@@ -1,11 +1,11 @@
 use std::{path::Path, time::Instant};
 
 use jeys_hash_set::{BatchingParameter, HashSet};
-use tokio::{fs::remove_file, io};
+use tokio::{fs, io};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
-const DEGREE: u8 = 20;
+const DEGREE: u8 = 22;
 const NB_INSERT: u32 = 2u32.pow(DEGREE as u32 + 3);
 
 #[tokio::main]
@@ -16,9 +16,6 @@ async fn main() -> io::Result<()> {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     for batching_size_i in 7..17 {
-        remove_file("data/data.bin").await;
-        remove_file("data/journal.bin").await;
-
         let batching_size: u32 = 2u32.pow(batching_size_i);
 
         let batching_param = BatchingParameter {
@@ -31,7 +28,7 @@ async fn main() -> io::Result<()> {
 
         let mut data = Vec::with_capacity(batching_size as usize);
 
-        let time = Instant::now();
+        let mut time = Instant::now();
         for i in 0..(NB_INSERT / batching_size) {
             data.clear();
             for y in 0..batching_size {
@@ -47,16 +44,16 @@ async fn main() -> io::Result<()> {
             elapsed,
             elapsed / NB_INSERT
         );
-        println!("");
+        println!();
 
         drop(hash_set);
 
-        let time = Instant::now();
+        time = Instant::now();
         let hash_set2: HashSet = HashSet::from_file(Path::new("data"), batching_param)
             .await
             .unwrap();
         info!("recovery time {:?}", time.elapsed());
-        println!("");
+        println!();
     }
 
     Ok(())

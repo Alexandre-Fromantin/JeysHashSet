@@ -3,15 +3,23 @@ use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::ptr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{io, path::Path};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{self, JoinHandle};
+use tracing::info;
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 mod direct_file;
 mod journal;
-use journal::{JournalLog, JournalManager};
+mod multi_journal;
+use journal::JournalLog;
+
+use crate::multi_journal::MultiJournalManager;
 
 const DELETE_FLAG: u8 = 0xFE;
 const EMPTY_FLAG: u8 = 0xFF;
@@ -20,12 +28,12 @@ const NB_KEY_IN_EACH_GROUP: usize = 16;
 
 pub struct HashSet {
     data_file: File,
-    data_file_mmap: MmapMut,
+    data_file_mmap_arc: Arc<MmapMut>,
     ptr: HashSetPtr,
     h1_shift: usize,
     nb_group: usize,
     nb_slot: usize,
-    journal_manager: JournalManager,
+    journal_manager: MultiJournalManager,
     batching_data: BatchingData,
 }
 
@@ -120,12 +128,15 @@ impl HashSet {
         let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
         let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
         let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
+        let data_file_mmap_arc = Arc::new(data_file_mmap);
 
-        let journal_manager = JournalManager::new(directory_path, batching_param).await?;
+        let journal_manager =
+            MultiJournalManager::new(&data_file_mmap_arc, directory_path.into(), batching_param)
+                .await?;
 
         Ok(Self {
             data_file,
-            data_file_mmap,
+            data_file_mmap_arc,
             ptr: HashSetPtr {
                 ctrl: ctrl_ptr,
                 key: key_ptr,
@@ -163,14 +174,18 @@ impl HashSet {
             ctrl: ctrl_ptr,
             key: key_ptr,
         };
+        let data_file_mmap_arc = Arc::new(data_file_mmap);
 
-        let journal_manager = JournalManager::from_file(directory_path, data_ptr, batching_param)
-            .await
-            .unwrap();
+        let journal_manager = MultiJournalManager::from_directory(
+            &data_file_mmap_arc,
+            directory_path.into(),
+            batching_param,
+        )
+        .await?;
 
         Ok(Self {
             data_file,
-            data_file_mmap,
+            data_file_mmap_arc,
             ptr: data_ptr,
             h1_shift: 64 - config.degree as usize,
             nb_group,
@@ -285,6 +300,16 @@ impl HashSet {
         }
 
         &self.batching_data.batch_insert_result
+    }
+
+    pub fn test_flush(&mut self) {
+        self.data_file_mmap_arc
+            .flush_range(self.nb_slot + 4096, 4 * 1024)
+            .unwrap();
+    }
+
+    pub fn test_big_flush(&mut self) {
+        self.data_file_mmap_arc.flush().unwrap();
     }
 
     async fn batch_insert_one_key(&mut self, key: u64) -> bool {
@@ -479,5 +504,58 @@ unsafe fn simd_match_byte(simd_data: __m128i, byte: u8) -> u16 {
 
         let cmp = _mm_cmpeq_epi8(simd_data, hash_vec);
         _mm_movemask_epi8(cmp) as u16
+    }
+}
+
+struct FlushManager {
+    task: JoinHandle<()>,
+    sender: mpsc::Sender<oneshot::Sender<Result<(), ()>>>,
+}
+
+impl FlushManager {
+    pub fn new(memmap_arc: &Arc<MmapMut>) -> Self {
+        let (sender, receiver) = mpsc::channel(5);
+        let task = task::spawn(flush_manager_task(Arc::clone(memmap_arc), receiver));
+        FlushManager { task, sender }
+    }
+
+    pub fn flush(&mut self) -> oneshot::Receiver<Result<(), ()>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.try_send(sender);
+        receiver
+    }
+}
+
+async fn flush_manager_task(
+    memmap_arc: Arc<MmapMut>,
+    mut receiver: mpsc::Receiver<oneshot::Sender<Result<(), ()>>>,
+) {
+    loop {
+        let recv_opt = receiver.recv().await;
+        if recv_opt.is_none() {
+            break;
+        }
+        let result_sender = recv_opt.unwrap();
+        let task_memmap_arc = Arc::clone(&memmap_arc);
+        let task_result = task::spawn_blocking(move || {
+            let time = Instant::now();
+            let flush_result = task_memmap_arc.flush();
+            info!("{:?}", time.elapsed());
+            flush_result
+        })
+        .await;
+        if task_result.is_err() {
+            let _ = result_sender.send(Err(()));
+            continue;
+        }
+        let flush_result = task_result.unwrap();
+        match flush_result {
+            Ok(_) => {
+                let _ = result_sender.send(Ok(()));
+            }
+            Err(_) => {
+                let _ = result_sender.send(Err(()));
+            }
+        }
     }
 }

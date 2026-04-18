@@ -1,9 +1,15 @@
-use std::path::Path;
+use std::{
+    mem,
+    path::{Path, PathBuf},
+};
 
 use crc32fast as crc32;
 use libm::ceil;
 use memmap2::Mmap;
-use tokio::{fs::OpenOptions, io};
+use tokio::{
+    fs::{OpenOptions, remove_file},
+    io,
+};
 use tracing::{info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, LittleEndian, U32, U64};
@@ -33,12 +39,20 @@ const INTEGRITY_CHECK_SIZE: usize = size_of::<IntergrityCheckType>();
 
 pub struct JournalManager {
     journal_file: DirectFile,
+    journal_file_path: PathBuf,
+    id: u32,
     nb_log: u32,
+    destroy_on_drop: bool,
 }
 
 impl JournalManager {
-    pub async fn new(directory_path: &Path, batching_param: BatchingParameter) -> io::Result<Self> {
-        let journal_file_path = Path::new(directory_path).join("journal.bin");
+    pub async fn new(
+        directory_path: &Path,
+        journal_id: u32,
+        batching_param: BatchingParameter,
+    ) -> io::Result<Self> {
+        let journal_file_path =
+            Path::new(directory_path).join(format!("journal-{:}.bin", journal_id));
         let mut journal_file = DirectFile::new(
             &journal_file_path,
             nb_allocated_sector_for_batching_param(batching_param),
@@ -48,16 +62,21 @@ impl JournalManager {
 
         Ok(Self {
             journal_file,
+            journal_file_path,
+            id: journal_id,
             nb_log: 0,
+            destroy_on_drop: false,
         })
     }
 
     pub async fn from_file(
         directory_path: &Path,
         hash_set_ptr: HashSetPtr,
+        journal_id: u32,
         batching_param: BatchingParameter,
     ) -> io::Result<Self> {
-        let journal_file_path = Path::new(directory_path).join("journal.bin");
+        let journal_file_path =
+            Path::new(directory_path).join(format!("journal-{:}.bin", journal_id));
         let check_result = check_journal_file(&journal_file_path, hash_set_ptr).await?;
 
         if check_result.file_corrupted {
@@ -95,7 +114,10 @@ impl JournalManager {
 
         Ok(Self {
             journal_file,
+            journal_file_path,
+            id: journal_id,
             nb_log: 0,
+            destroy_on_drop: false,
         })
     }
 
@@ -122,6 +144,29 @@ impl JournalManager {
         self.journal_file.skip(JOURNAL_HEADER_SIZE); //reserve header space
 
         write_res
+    }
+
+    pub fn journal_size(&self) -> u64 {
+        self.journal_file.file_size()
+    }
+
+    pub fn active_delete_on_drop(&mut self) {
+        self.destroy_on_drop = true;
+    }
+
+    pub fn get_id(&self) -> u32 {
+        self.id
+    }
+}
+
+impl Drop for JournalManager {
+    fn drop(&mut self) {
+        if self.destroy_on_drop {
+            let journal_file_path = mem::take(&mut self.journal_file_path);
+            tokio::spawn(async move {
+                let _ = remove_file(journal_file_path).await;
+            });
+        }
     }
 }
 
