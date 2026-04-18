@@ -20,6 +20,9 @@ pub struct DirectFile {
 }
 
 impl DirectFile {
+    ///Create a file from the `file_path`, with a direct write without OS cache and with disk synchronization.
+    ///
+    ///`nb_sectors_allocated` is used to set the preallocated size of the write buffer, in sector count, that is a byte size of ```nb_sectors_allocated * 4096 (sector size of a disk in bytes)```.
     pub async fn new(file_path: &Path, nb_sectors_allocated: usize) -> io::Result<Self> {
         let file = open_file_without_os_cache_and_write_sync(file_path, true).await?;
 
@@ -36,6 +39,11 @@ impl DirectFile {
         })
     }
 
+    ///Open a file from the `file_path`, with a direct write without OS cache and with disk synchronization.
+    ///
+    ///`nb_sectors_allocated` is used to set the preallocated size of the write buffer, in sector count, that is a byte size of `nb_sectors_allocated` * 4096 (sector size of a disk in bytes).
+    ///
+    ///`start_idx` is the index in the file, where writing begins.
     pub async fn from_file(
         file_path: &Path,
         nb_sectors_allocated: usize,
@@ -64,6 +72,7 @@ impl DirectFile {
         })
     }
 
+    ///Write a slice of bytes, in the write buffer.
     pub fn write_slice(&mut self, slice: &[u8]) {
         self.check_enough_space(slice.len());
 
@@ -71,15 +80,20 @@ impl DirectFile {
         self.write_idx += slice.len();
     }
 
+    ///Add `n` bytes to the write index.
     pub fn skip(&mut self, n: usize) {
         self.check_enough_space(n);
         self.write_idx += n;
     }
 
+    ///Returns the slice of all data written to the write buffer since the last disk write.
     pub fn get_buffer(&mut self) -> &mut [u8] {
         &mut self.buffer[self.start_idx..self.write_idx]
     }
 
+    ///Check if the current write buffer is long enough for a write of `space_needed` bytes.
+    ///
+    ///If the current write buffer is not long enough, it resizes the write buffer by adding the necessary sector amount for a write of `space_needed` bytes.
     fn check_enough_space(&mut self, space_needed: usize) {
         if self.remaining_free_space() < space_needed {
             //not enough space
@@ -88,14 +102,17 @@ impl DirectFile {
         }
     }
 
+    ///Returns the total capacity of the write buffer.
     fn total_capacity(&self) -> usize {
         self.buffer.len()
     }
 
+    ///Returns the remaining free buffer space of the write buffer.
     fn remaining_free_space(&self) -> usize {
         self.total_capacity() - self.write_idx
     }
 
+    ///Add `n` sector to the write buffer.
     fn add_n_sector(&mut self, nb_new_sector: usize) {
         let mut temp_vec: AVec<u8, ConstAlign<SECTOR_SIZE>> = unsafe {
             AVec::from_raw_parts(
@@ -109,6 +126,14 @@ impl DirectFile {
         self.buffer = ManuallyDrop::new(temp_vec.into_boxed_slice())
     }
 
+    ///Write the write buffer in the disk.
+    ///
+    ///If the function returns Ok(), all data written to the write buffer is guaranteed by the disk to be persistent.
+    ///
+    ///If the function returns Err(), data written to the write buffer may not be written, or may be partially or completely written.
+    ///Nothing guarantees persistency, but the data may well be written completely despite an error.
+    ///
+    ///If the function stops momentarily (power outage, hardware crash, etc.), the outcomes are the same as if the function returned Err().
     pub async fn write_on_disk(&mut self) -> io::Result<()> {
         let seek_result = self
             .file
@@ -137,6 +162,7 @@ impl DirectFile {
         }
     }
 
+    ///Returns the file size
     pub fn file_size(&self) -> u64 {
         (self.start_sector + 1) * SECTOR_SIZE_U64
     }
