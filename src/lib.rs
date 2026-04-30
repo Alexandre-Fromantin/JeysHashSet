@@ -1,25 +1,26 @@
 use memmap2::MmapMut;
 use std::arch::x86_64::*;
-use std::collections::HashMap;
 use std::io::SeekFrom;
-use std::ptr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use std::{io, path::Path};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::{self, JoinHandle};
-use tracing::info;
+use windows::Win32::Storage::FileSystem;
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+pub mod batching;
 mod direct_file;
+mod flush;
 mod journal;
 mod multi_journal;
+mod simd;
+
 use journal::JournalLog;
 
+use crate::batching::{BatchingData, BatchingParameter};
 use crate::multi_journal::MultiJournalManager;
+use crate::simd::simd_match_byte;
 
 const DELETE_FLAG: u8 = 0xFE;
 const EMPTY_FLAG: u8 = 0xFF;
@@ -28,8 +29,7 @@ const NB_KEY_IN_EACH_GROUP: usize = 16;
 
 pub struct HashSet {
     data_file: File,
-    data_file_mmap_arc: Arc<MmapMut>,
-    ptr: HashSetPtr,
+    mmap: HashSetMemMap,
     h1_shift: usize,
     nb_group: usize,
     nb_slot: usize,
@@ -46,59 +46,23 @@ struct HashSetConfig {
 const CONFIG_SIZE: usize = size_of::<HashSetConfig>();
 const ALIGNED_CONFIG_SIZE: usize = CONFIG_SIZE + (64 - CONFIG_SIZE % 64); //cache friendly
 
-#[derive(Clone, Copy)]
-pub struct HashSetPtr {
-    pub ctrl: *mut u8,
-    pub key: *mut u64,
-}
-
-struct TemporaryModificationGroup {
-    ctrl: [u8; NB_KEY_IN_EACH_GROUP],
-    key: [u64; NB_KEY_IN_EACH_GROUP],
-}
-
-#[derive(Clone, Copy)]
-pub struct BatchingParameter {
-    pub pre_allocated_size: usize,
-}
-
-struct BatchingData {
-    temp_modif_hashmap: HashMap<usize, TemporaryModificationGroup>,
-    batch_insert_result: Vec<bool>,
-}
-impl BatchingData {
-    fn from_param(param: BatchingParameter) -> Self {
-        Self {
-            temp_modif_hashmap: HashMap::with_capacity(param.pre_allocated_size * 2),
-            batch_insert_result: Vec::with_capacity(param.pre_allocated_size),
-        }
-    }
-}
-
-struct BatchingSelectedSlot {
-    slot_id: usize,
-    group: BatchingGroup,
-    key_index_in_group: u8,
-}
-
-enum BatchingGroup {
-    OnlyRead { group_id: usize },
-    ReadWrite { ptr: HashSetPtr },
-}
-
 impl HashSet {
     pub async fn new(
         directory_path: &Path,
         degree: u8,
         batching_param: BatchingParameter,
     ) -> io::Result<Self> {
+        use windows::Win32::Storage::FileSystem;
+
         let data_file_path = Path::new(directory_path).join("data.bin");
         let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(FileSystem::FILE_FLAG_RANDOM_ACCESS.0)
             .create_new(true)
             .open(data_file_path)
             .await?;
+        //TODO: add RANDOM_ACCESS FLAG for memmap optimization
 
         let nb_group = 2usize.pow(degree as u32);
         let nb_slot = nb_group * NB_KEY_IN_EACH_GROUP;
@@ -125,22 +89,13 @@ impl HashSet {
 
         data_file.sync_all().await.unwrap();
 
-        let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
-        let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
-        let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
-        let data_file_mmap_arc = Arc::new(data_file_mmap);
-
+        let mmap = HashSetMemMap::from_file(&data_file, nb_slot)?;
         let journal_manager =
-            MultiJournalManager::new(&data_file_mmap_arc, directory_path.into(), batching_param)
-                .await?;
+            MultiJournalManager::new(&mmap, directory_path.into(), batching_param).await?;
 
         Ok(Self {
             data_file,
-            data_file_mmap_arc,
-            ptr: HashSetPtr {
-                ctrl: ctrl_ptr,
-                key: key_ptr,
-            },
+            mmap,
             h1_shift: 64 - degree as usize,
             nb_group,
             nb_slot,
@@ -167,26 +122,14 @@ impl HashSet {
         let nb_group = 2usize.pow(config.degree as u32);
         let nb_slot = nb_group * NB_KEY_IN_EACH_GROUP;
 
-        let mut data_file_mmap = unsafe { MmapMut::map_mut(&data_file)? };
-        let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
-        let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
-        let data_ptr = HashSetPtr {
-            ctrl: ctrl_ptr,
-            key: key_ptr,
-        };
-        let data_file_mmap_arc = Arc::new(data_file_mmap);
-
-        let journal_manager = MultiJournalManager::from_directory(
-            &data_file_mmap_arc,
-            directory_path.into(),
-            batching_param,
-        )
-        .await?;
+        let mmap = HashSetMemMap::from_file(&data_file, nb_slot)?;
+        let journal_manager =
+            MultiJournalManager::from_directory(&mmap, directory_path.into(), batching_param)
+                .await?;
 
         Ok(Self {
             data_file,
-            data_file_mmap_arc,
-            ptr: data_ptr,
+            mmap,
             h1_shift: 64 - config.degree as usize,
             nb_group,
             nb_slot,
@@ -205,7 +148,7 @@ impl HashSet {
         let mut nb_probing = 0;
 
         loop {
-            let ctrl_group_ptr = unsafe { self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
+            let ctrl_group_ptr = unsafe { self.mmap.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
             let ctrl_group_simd = unsafe { _mm_loadu_si128(ctrl_group_ptr as *const __m128i) };
 
             let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
@@ -215,7 +158,7 @@ impl HashSet {
 
                 unsafe {
                     if *self
-                        .ptr
+                        .mmap
                         .key
                         .add(NB_KEY_IN_EACH_GROUP * group_id + key_idx_in_group)
                         == key
@@ -265,191 +208,9 @@ impl HashSet {
         self.journal_manager.finalize().await.unwrap();
 
         unsafe {
-            *self.ptr.ctrl.add(selected_slot) = h2;
-            *self.ptr.key.add(selected_slot) = key;
+            *self.mmap.ctrl.add(selected_slot) = h2;
+            *self.mmap.key.add(selected_slot) = key;
         }
-
-        true
-    }
-
-    pub async fn batch_insert(&mut self, list_key: &[u64]) -> &[bool] {
-        self.batching_data.temp_modif_hashmap.clear();
-        self.batching_data.batch_insert_result.clear();
-
-        for key in list_key {
-            let success = self.batch_insert_one_key(*key).await;
-            self.batching_data.batch_insert_result.push(success);
-        }
-
-        self.journal_manager.finalize().await.unwrap();
-
-        //update file mmap
-        for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    modif.ctrl.as_ptr(),
-                    self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP),
-                    NB_KEY_IN_EACH_GROUP,
-                );
-                ptr::copy_nonoverlapping(
-                    modif.key.as_ptr(),
-                    self.ptr.key.add(group_id * NB_KEY_IN_EACH_GROUP),
-                    NB_KEY_IN_EACH_GROUP,
-                );
-            }
-        }
-
-        &self.batching_data.batch_insert_result
-    }
-
-    pub fn test_flush(&mut self) {
-        self.data_file_mmap_arc
-            .flush_range(self.nb_slot + 4096, 4 * 1024)
-            .unwrap();
-    }
-
-    pub fn test_big_flush(&mut self) {
-        self.data_file_mmap_arc.flush().unwrap();
-    }
-
-    async fn batch_insert_one_key(&mut self, key: u64) -> bool {
-        let key_hash = xxh3_64(&key.to_le_bytes()) as usize;
-        let h2: u8 = key_hash as u8 & 0b01_11_11_11;
-
-        let mut selected_slot_opt: Option<BatchingSelectedSlot> = None;
-
-        let mut group_id = key_hash >> self.h1_shift;
-        let mut nb_probing = 0;
-        loop {
-            let (is_on_mmap, group_ptr) = self
-                .batching_data
-                .temp_modif_hashmap
-                .get_mut(&group_id)
-                .map_or(
-                    (true, unsafe {
-                        HashSetPtr {
-                            ctrl: self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP),
-                            key: self.ptr.key.add(group_id * NB_KEY_IN_EACH_GROUP),
-                        }
-                    }),
-                    |temp_group| {
-                        (
-                            false,
-                            HashSetPtr {
-                                ctrl: temp_group.ctrl.as_mut_ptr(),
-                                key: temp_group.key.as_mut_ptr(),
-                            },
-                        )
-                    },
-                );
-            let ctrl_group_simd = unsafe { _mm_loadu_si128(group_ptr.ctrl as *const __m128i) };
-
-            let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
-            while candidate_mask != 0 {
-                //Iter on each candidate
-                let key_idx_in_group = candidate_mask.trailing_zeros() as usize;
-
-                unsafe {
-                    if *group_ptr.key.add(key_idx_in_group) == key {
-                        return false;
-                    }
-                }
-
-                candidate_mask &= candidate_mask - 1;
-            }
-            let empty_mask = unsafe { simd_match_byte(ctrl_group_simd, EMPTY_FLAG) };
-            if empty_mask != 0 {
-                if selected_slot_opt.is_none() {
-                    let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
-                    let key_index_in_group = if delete_mask != 0 {
-                        delete_mask
-                    } else {
-                        empty_mask
-                    }
-                    .trailing_zeros() as u8;
-                    if is_on_mmap {
-                        selected_slot_opt = Some(BatchingSelectedSlot {
-                            slot_id: group_id * 16 + key_index_in_group as usize,
-                            group: BatchingGroup::OnlyRead { group_id },
-                            key_index_in_group,
-                        });
-                    } else {
-                        selected_slot_opt = Some(BatchingSelectedSlot {
-                            slot_id: group_id * 16 + key_index_in_group as usize,
-                            group: BatchingGroup::ReadWrite { ptr: group_ptr },
-                            key_index_in_group,
-                        });
-                    }
-                }
-                break;
-            }
-
-            if selected_slot_opt.is_none() {
-                let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
-                if delete_mask != 0 {
-                    let key_index_in_group = delete_mask.trailing_zeros() as u8;
-                    if is_on_mmap {
-                        selected_slot_opt = Some(BatchingSelectedSlot {
-                            slot_id: group_id * 16 + key_index_in_group as usize,
-                            group: BatchingGroup::OnlyRead { group_id },
-                            key_index_in_group,
-                        });
-                    } else {
-                        selected_slot_opt = Some(BatchingSelectedSlot {
-                            slot_id: group_id * 16 + key_index_in_group as usize,
-                            group: BatchingGroup::ReadWrite { ptr: group_ptr },
-                            key_index_in_group,
-                        });
-                    }
-                }
-            }
-
-            nb_probing += 1;
-            group_id += nb_probing;
-            if group_id >= self.nb_group {
-                group_id &= self.nb_group - 1; //nb_group is a pow of 2
-            }
-        }
-
-        let selected_slot = selected_slot_opt.unwrap(); //safe unwrap
-        match selected_slot.group {
-            BatchingGroup::OnlyRead { group_id } => {
-                let mut ctrl_slice = [0u8; NB_KEY_IN_EACH_GROUP];
-                let mut key_slice = [0u64; NB_KEY_IN_EACH_GROUP];
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP),
-                        ctrl_slice.as_mut_ptr(),
-                        NB_KEY_IN_EACH_GROUP,
-                    );
-                    ptr::copy_nonoverlapping(
-                        self.ptr.key.add(group_id * NB_KEY_IN_EACH_GROUP),
-                        key_slice.as_mut_ptr(),
-                        NB_KEY_IN_EACH_GROUP,
-                    );
-                }
-                ctrl_slice[selected_slot.key_index_in_group as usize] = h2;
-                key_slice[selected_slot.key_index_in_group as usize] = key;
-                self.batching_data.temp_modif_hashmap.insert(
-                    group_id,
-                    TemporaryModificationGroup {
-                        ctrl: ctrl_slice,
-                        key: key_slice,
-                    },
-                );
-            }
-            BatchingGroup::ReadWrite { ptr: group_ptr } => unsafe {
-                *group_ptr
-                    .ctrl
-                    .add(selected_slot.key_index_in_group as usize) = h2;
-                *group_ptr.key.add(selected_slot.key_index_in_group as usize) = key;
-            },
-        }
-
-        self.journal_manager.add_log(JournalLog {
-            slot_id: (selected_slot.slot_id as u64).into(),
-            key: key.into(),
-        });
 
         true
     }
@@ -462,7 +223,7 @@ impl HashSet {
         let mut nb_probing = 0;
 
         loop {
-            let ctrl_group_ptr = unsafe { self.ptr.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
+            let ctrl_group_ptr = unsafe { self.mmap.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
             let ctrl_group_simd = unsafe { _mm_loadu_si128(ctrl_group_ptr as *const __m128i) };
 
             let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
@@ -472,7 +233,7 @@ impl HashSet {
 
                 unsafe {
                     if *self
-                        .ptr
+                        .mmap
                         .key
                         .add(NB_KEY_IN_EACH_GROUP * group_id + key_idx_in_group)
                         == key
@@ -498,64 +259,27 @@ impl HashSet {
     }
 }
 
-unsafe fn simd_match_byte(simd_data: __m128i, byte: u8) -> u16 {
-    unsafe {
-        let hash_vec = _mm_set1_epi8(byte as i8);
-
-        let cmp = _mm_cmpeq_epi8(simd_data, hash_vec);
-        _mm_movemask_epi8(cmp) as u16
-    }
+struct HashSetMemMap {
+    mmap_arc: Arc<MmapMut>,
+    pub ctrl: *mut u8,
+    pub key: *mut u64,
 }
 
-struct FlushManager {
-    task: JoinHandle<()>,
-    sender: mpsc::Sender<oneshot::Sender<Result<(), ()>>>,
-}
-
-impl FlushManager {
-    pub fn new(memmap_arc: &Arc<MmapMut>) -> Self {
-        let (sender, receiver) = mpsc::channel(5);
-        let task = task::spawn(flush_manager_task(Arc::clone(memmap_arc), receiver));
-        FlushManager { task, sender }
-    }
-
-    pub fn flush(&mut self) -> oneshot::Receiver<Result<(), ()>> {
-        let (sender, receiver) = oneshot::channel();
-        self.sender.try_send(sender);
-        receiver
-    }
-}
-
-async fn flush_manager_task(
-    memmap_arc: Arc<MmapMut>,
-    mut receiver: mpsc::Receiver<oneshot::Sender<Result<(), ()>>>,
-) {
-    loop {
-        let recv_opt = receiver.recv().await;
-        if recv_opt.is_none() {
-            break;
-        }
-        let result_sender = recv_opt.unwrap();
-        let task_memmap_arc = Arc::clone(&memmap_arc);
-        let task_result = task::spawn_blocking(move || {
-            let time = Instant::now();
-            let flush_result = task_memmap_arc.flush();
-            info!("{:?}", time.elapsed());
-            flush_result
+impl HashSetMemMap {
+    pub fn from_file(data_file: &File, nb_slot: usize) -> io::Result<Self> {
+        let mut data_file_mmap = unsafe { MmapMut::map_mut(data_file)? };
+        let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
+        let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
+        Ok(Self {
+            mmap_arc: Arc::new(data_file_mmap),
+            ctrl: ctrl_ptr,
+            key: key_ptr,
         })
-        .await;
-        if task_result.is_err() {
-            let _ = result_sender.send(Err(()));
-            continue;
-        }
-        let flush_result = task_result.unwrap();
-        match flush_result {
-            Ok(_) => {
-                let _ = result_sender.send(Ok(()));
-            }
-            Err(_) => {
-                let _ = result_sender.send(Err(()));
-            }
-        }
+    }
+}
+
+impl Drop for HashSetMemMap {
+    fn drop(&mut self) {
+        self.mmap_arc.flush().unwrap();
     }
 }

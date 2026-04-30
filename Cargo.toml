@@ -13,6 +13,7 @@ futures = "0.3.32"
 libm = "0.2.16"
 memmap2 = "0.9.10"
 replace_with = "0.1.8"
+sorted-vec = "0.8.10"
 tokio = { version = "1.51.0", features = ["sync", "rt", "fs", "io-util", "time"] }
 tracing = "0.1.44"
 zerocopy = { version = "0.8.48", features = ["derive"] }

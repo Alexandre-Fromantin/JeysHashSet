@@ -1,12 +1,15 @@
-use std::{path::Path, time::Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
-use jeys_hash_set::{BatchingParameter, HashSet};
+use jeys_hash_set::{HashSet, batching::BatchingParameter};
 use tokio::{fs, io};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
-const DEGREE: u8 = 22;
-const NB_INSERT: u32 = 2u32.pow(DEGREE as u32 + 3);
+const DEGREE: u8 = 29;
+const NB_INSERT: u32 = 2u32.pow(20);
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -15,7 +18,7 @@ async fn main() -> io::Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    for batching_size_i in 7..17 {
+    for batching_size_i in 9..17 {
         let batching_size: u32 = 2u32.pow(batching_size_i);
 
         let batching_param = BatchingParameter {

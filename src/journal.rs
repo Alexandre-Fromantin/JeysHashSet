@@ -15,7 +15,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, LittleEndian, U32, U64};
 
 use crate::{
-    BatchingParameter, HashSetPtr,
+    BatchingParameter, HashSetMemMap,
     direct_file::{DirectFile, SECTOR_SIZE},
 };
 
@@ -69,15 +69,15 @@ impl JournalManager {
         })
     }
 
-    pub async fn from_file(
+    pub async fn open(
         directory_path: &Path,
-        hash_set_ptr: HashSetPtr,
         journal_id: u32,
         batching_param: BatchingParameter,
-    ) -> io::Result<Self> {
+        hashset_mmap: &HashSetMemMap,
+    ) -> io::Result<Option<Self>> {
         let journal_file_path =
             Path::new(directory_path).join(format!("journal-{:}.bin", journal_id));
-        let check_result = check_journal_file(&journal_file_path, hash_set_ptr).await?;
+        let check_result = check_journal_file(&journal_file_path, hashset_mmap).await?;
 
         if check_result.file_corrupted {
             warn!(
@@ -86,39 +86,34 @@ impl JournalManager {
             );
         }
 
-        let mut journal_file = if !check_result.change_detected {
-            info!("Journal file does bring change");
-            if check_result.file_corrupted {
-                warn!(
-                    "Truncate journal file after the index {}",
-                    check_result.end_file_idx
-                );
-            }
-            DirectFile::from_file(
-                &journal_file_path,
-                nb_allocated_sector_for_batching_param(batching_param),
-                check_result.end_file_idx,
-            )
-            .await?
-        } else {
+        if !check_result.change_detected {
             info!("Journal file does not bring any change");
-            info!("Empty the journal file");
-            DirectFile::from_file(
-                &journal_file_path,
-                nb_allocated_sector_for_batching_param(batching_param),
-                0,
-            )
-            .await?
-        };
+            let _ = remove_file(journal_file_path).await;
+            return Ok(None);
+        }
+
+        info!("Journal file does bring change");
+        if check_result.file_corrupted {
+            warn!(
+                "Truncate journal file after the index {}",
+                check_result.end_file_idx
+            );
+        }
+        let mut journal_file = DirectFile::from_file(
+            &journal_file_path,
+            nb_allocated_sector_for_batching_param(batching_param),
+            check_result.end_file_idx,
+        )
+        .await?;
         journal_file.skip(JOURNAL_HEADER_SIZE); //reserve header space
 
-        Ok(Self {
+        Ok(Some(Self {
             journal_file,
             journal_file_path,
             id: journal_id,
             nb_log: 0,
             destroy_on_drop: false,
-        })
+        }))
     }
 
     pub fn add_log(&mut self, log: JournalLog) {
@@ -163,8 +158,16 @@ impl Drop for JournalManager {
     fn drop(&mut self) {
         if self.destroy_on_drop {
             let journal_file_path = mem::take(&mut self.journal_file_path);
+            let journal_id = self.id;
             tokio::spawn(async move {
-                let _ = remove_file(journal_file_path).await;
+                let res = remove_file(journal_file_path).await;
+                match res {
+                    Ok(_) => info!("journal file (id:{}) deleted", journal_id),
+                    Err(error) => warn!(
+                        "error while try to delete journal file (id:{}): {}",
+                        journal_id, error
+                    ),
+                }
             });
         }
     }
@@ -178,12 +181,13 @@ struct CheckResult {
 
 async fn check_journal_file(
     journal_file_path: &Path,
-    hash_set_ptr: HashSetPtr,
+    hashset_mmap: &HashSetMemMap,
 ) -> io::Result<CheckResult> {
     let journal_file = OpenOptions::new()
         .read(true)
         .open(&journal_file_path)
         .await?;
+    //TODO: add SEQUANTIAL FLAG for memmap optimization
 
     let mut change_detected = false;
     let mut file_corrupted = false;
@@ -248,14 +252,14 @@ async fn check_journal_file(
 
             unsafe {
                 if change_detected
-                    || *hash_set_ptr.ctrl.add(slot_id)
+                    || *hashset_mmap.ctrl.add(slot_id)
                         != (xxh3_64(&key.to_le_bytes()) & 0b01_11_11_11) as u8
-                    || *hash_set_ptr.key.add(slot_id) != key
+                    || *hashset_mmap.key.add(slot_id) != key
                 {
                     change_detected = true;
-                    *hash_set_ptr.ctrl.add(slot_id) =
+                    *hashset_mmap.ctrl.add(slot_id) =
                         (xxh3_64(&key.to_le_bytes()) & 0b01_11_11_11) as u8;
-                    *hash_set_ptr.key.add(slot_id) = key;
+                    *hashset_mmap.key.add(slot_id) = key;
                 }
             }
 
