@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::{io, path::Path};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use windows::Win32::Storage::FileSystem;
 use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -19,13 +18,57 @@ mod simd;
 use journal::JournalLog;
 
 use crate::batching::{BatchingData, BatchingParameter};
+use crate::journal::SlotId;
 use crate::multi_journal::MultiJournalManager;
 use crate::simd::simd_match_byte;
 
-const DELETE_FLAG: u8 = 0xFE;
-const EMPTY_FLAG: u8 = 0xFF;
+const DELETE_FLAG: u8 = 0b00_00_00_01; //0xFE;
+const EMPTY_FLAG: u8 = 0b00_00_00_00; //0xFF;
 
 const NB_KEY_IN_EACH_GROUP: usize = 16;
+
+struct HashSetGroupReadOnly {
+    ctrl: *const u8,
+    key: *const u64,
+}
+impl HashSetGroupReadOnly {
+    fn get_ctrl(&self, group_slot_idx: usize) -> u8 {
+        unsafe { *self.ctrl.add(group_slot_idx) }
+    }
+
+    fn get_key(&self, group_slot_idx: usize) -> u64 {
+        unsafe { *self.key.add(group_slot_idx) }
+    }
+
+    fn load_ctrl_simd(&self) -> __m128i {
+        unsafe { _mm_loadu_si128(self.ctrl as *const __m128i) }
+    }
+}
+
+struct HashSetGroup {
+    ctrl: *mut u8,
+    key: *mut u64,
+}
+impl HashSetGroup {
+    fn set(&mut self, ctrl: u8, key: u64, group_slot_idx: usize) {
+        unsafe {
+            *self.ctrl.add(group_slot_idx) = ctrl;
+            *self.key.add(group_slot_idx) = key;
+        }
+    }
+
+    fn get_ctrl(&self, group_slot_idx: usize) -> u8 {
+        unsafe { *self.ctrl.add(group_slot_idx) }
+    }
+
+    fn get_key(&self, group_slot_idx: usize) -> u64 {
+        unsafe { *self.key.add(group_slot_idx) }
+    }
+
+    fn load_ctrl_simd(&self) -> __m128i {
+        unsafe { _mm_loadu_si128(self.ctrl as *const __m128i) }
+    }
+}
 
 pub struct HashSet {
     data_file: File,
@@ -78,18 +121,9 @@ impl HashSet {
             .await
             .unwrap();
 
-        let write_buf = vec![EMPTY_FLAG; 8 * 1024].into_boxed_slice();
-        for _ in 0..(nb_slot / (8 * 1024)) {
-            data_file.write_all(&write_buf).await.unwrap();
-        }
-        data_file
-            .write_all(&write_buf[0..nb_slot % (8 * 1024)])
-            .await
-            .unwrap();
-
         data_file.sync_all().await.unwrap();
 
-        let mmap = HashSetMemMap::from_file(&data_file, nb_slot)?;
+        let mmap = HashSetMemMap::from_file(&data_file)?;
         let journal_manager =
             MultiJournalManager::new(&mmap, directory_path.into(), batching_param).await?;
 
@@ -122,9 +156,9 @@ impl HashSet {
         let nb_group = 2usize.pow(config.degree as u32);
         let nb_slot = nb_group * NB_KEY_IN_EACH_GROUP;
 
-        let mmap = HashSetMemMap::from_file(&data_file, nb_slot)?;
+        let mut mmap = HashSetMemMap::from_file(&data_file)?;
         let journal_manager =
-            MultiJournalManager::from_directory(&mmap, directory_path.into(), batching_param)
+            MultiJournalManager::from_directory(&mut mmap, directory_path.into(), batching_param)
                 .await?;
 
         Ok(Self {
@@ -140,55 +174,49 @@ impl HashSet {
 
     pub async fn insert(&mut self, key: u64) -> bool {
         let key_hash = xxh3_64(&key.to_le_bytes()) as usize;
-        let h2: u8 = key_hash as u8 & 0b01_11_11_11;
+        let h2: u8 = key_hash as u8 | 0b10_00_00_00;
 
-        let mut selected_slot_opt: Option<usize> = None;
+        let mut selected_slot_opt: Option<(usize, usize)> = None;
 
         let mut group_id = key_hash >> self.h1_shift;
         let mut nb_probing = 0;
 
         loop {
-            let ctrl_group_ptr = unsafe { self.mmap.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
-            let ctrl_group_simd = unsafe { _mm_loadu_si128(ctrl_group_ptr as *const __m128i) };
+            let group = self.mmap.group_read_only(group_id);
+            let ctrl_simd = group.load_ctrl_simd();
 
-            let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
+            let mut candidate_mask = unsafe { simd_match_byte(ctrl_simd, h2) };
             while candidate_mask != 0 {
                 //Iter on each candidate
-                let key_idx_in_group = candidate_mask.trailing_zeros() as usize;
+                let group_slot_idx = candidate_mask.trailing_zeros() as usize;
 
-                unsafe {
-                    if *self
-                        .mmap
-                        .key
-                        .add(NB_KEY_IN_EACH_GROUP * group_id + key_idx_in_group)
-                        == key
-                    {
-                        return false;
-                    }
+                if group.get_key(group_slot_idx) == key {
+                    //the key is already inserted
+                    return false;
                 }
 
                 candidate_mask &= candidate_mask - 1;
             }
 
-            let empty_mask = unsafe { simd_match_byte(ctrl_group_simd, EMPTY_FLAG) };
+            let empty_mask = unsafe { simd_match_byte(ctrl_simd, EMPTY_FLAG) };
             if empty_mask != 0 {
                 if selected_slot_opt.is_none() {
-                    let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
-                    let key_index_in_group = if delete_mask != 0 {
+                    let delete_mask = unsafe { simd_match_byte(ctrl_simd, DELETE_FLAG) };
+                    let group_slot_idx = if delete_mask != 0 {
                         delete_mask.trailing_zeros()
                     } else {
                         empty_mask.trailing_zeros()
                     } as usize;
-                    selected_slot_opt = Some(group_id * NB_KEY_IN_EACH_GROUP + key_index_in_group);
+                    selected_slot_opt = Some((group_id, group_slot_idx));
                 }
                 break;
             }
 
             if selected_slot_opt.is_none() {
-                let delete_mask = unsafe { simd_match_byte(ctrl_group_simd, DELETE_FLAG) };
+                let delete_mask = unsafe { simd_match_byte(ctrl_simd, DELETE_FLAG) };
                 if delete_mask != 0 {
-                    let key_index_in_group = delete_mask.trailing_zeros() as usize;
-                    selected_slot_opt = Some(group_id * NB_KEY_IN_EACH_GROUP + key_index_in_group);
+                    let group_slot_idx = delete_mask.trailing_zeros() as usize;
+                    selected_slot_opt = Some((group_id, group_slot_idx));
                 }
             }
 
@@ -199,47 +227,38 @@ impl HashSet {
             }
         }
 
-        let selected_slot = selected_slot_opt.unwrap(); //safe unwrap
+        let (selected_group, selected_group_slot_idx) = selected_slot_opt.unwrap(); //safe unwrap
 
         self.journal_manager.add_log(JournalLog {
-            slot_id: (selected_slot as u64).into(),
+            slot_id: SlotId::from(selected_group as u64, selected_group_slot_idx as u64),
             key: key.into(),
         });
         self.journal_manager.finalize().await.unwrap();
 
-        unsafe {
-            *self.mmap.ctrl.add(selected_slot) = h2;
-            *self.mmap.key.add(selected_slot) = key;
-        }
+        let mut group = self.mmap.group(group_id);
+        group.set(h2, key, selected_group_slot_idx);
 
         true
     }
 
     pub fn contains(&self, key: u64) -> bool {
         let key_hash = xxh3_64(&key.to_le_bytes()) as usize;
-        let h2: u8 = key_hash as u8 & 0b01_11_11_11;
+        let h2: u8 = key_hash as u8 | 0b10_00_00_00;
 
         let mut group_id = key_hash >> self.h1_shift;
         let mut nb_probing = 0;
 
         loop {
-            let ctrl_group_ptr = unsafe { self.mmap.ctrl.add(group_id * NB_KEY_IN_EACH_GROUP) };
-            let ctrl_group_simd = unsafe { _mm_loadu_si128(ctrl_group_ptr as *const __m128i) };
+            let group = self.mmap.group_read_only(group_id);
+            let ctrl_group_simd = group.load_ctrl_simd();
 
             let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
             while candidate_mask != 0 {
                 //Iter on each candidate
-                let key_idx_in_group = candidate_mask.trailing_zeros() as usize;
+                let group_slot_idx = candidate_mask.trailing_zeros() as usize;
 
-                unsafe {
-                    if *self
-                        .mmap
-                        .key
-                        .add(NB_KEY_IN_EACH_GROUP * group_id + key_idx_in_group)
-                        == key
-                    {
-                        return false;
-                    }
+                if group.get_key(group_slot_idx) == key {
+                    return true;
                 }
 
                 candidate_mask &= candidate_mask - 1; //remove the 1 most to the right
@@ -261,20 +280,45 @@ impl HashSet {
 
 struct HashSetMemMap {
     mmap_arc: Arc<MmapMut>,
-    pub ctrl: *mut u8,
-    pub key: *mut u64,
+    data_ptr: *mut u8,
 }
 
 impl HashSetMemMap {
-    pub fn from_file(data_file: &File, nb_slot: usize) -> io::Result<Self> {
+    pub fn from_file(data_file: &File) -> io::Result<Self> {
         let mut data_file_mmap = unsafe { MmapMut::map_mut(data_file)? };
-        let ctrl_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
-        let key_ptr = unsafe { ctrl_ptr.add(nb_slot) as *mut u64 };
+        let data_ptr = unsafe { data_file_mmap.as_mut_ptr().add(ALIGNED_CONFIG_SIZE) };
         Ok(Self {
             mmap_arc: Arc::new(data_file_mmap),
-            ctrl: ctrl_ptr,
-            key: key_ptr,
+            data_ptr,
         })
+    }
+
+    fn ctrl_group_ptr(&self, group_id: usize) -> *const u8 {
+        unsafe {
+            self.data_ptr
+                .add(group_id * NB_KEY_IN_EACH_GROUP * (1 + size_of::<u64>()))
+        }
+    }
+
+    fn key_group_ptr(&self, group_id: usize) -> *const u64 {
+        unsafe {
+            self.data_ptr.add(
+                group_id * NB_KEY_IN_EACH_GROUP * (1 + size_of::<u64>()) + NB_KEY_IN_EACH_GROUP,
+            ) as *const u64
+        }
+    }
+
+    pub fn group(&mut self, group_id: usize) -> HashSetGroup {
+        HashSetGroup {
+            ctrl: self.ctrl_group_ptr(group_id) as *mut u8,
+            key: self.key_group_ptr(group_id) as *mut u64,
+        }
+    }
+    pub fn group_read_only(&self, group_id: usize) -> HashSetGroupReadOnly {
+        HashSetGroupReadOnly {
+            ctrl: self.ctrl_group_ptr(group_id),
+            key: self.key_group_ptr(group_id),
+        }
     }
 }
 

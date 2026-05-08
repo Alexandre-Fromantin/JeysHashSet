@@ -47,7 +47,7 @@ impl MultiJournalManager {
     }
 
     pub async fn from_directory(
-        hash_set_mmap: &HashSetMemMap,
+        hash_set_mmap: &mut HashSetMemMap,
         journal_directory_path: Box<Path>,
         batching_param: BatchingParameter,
     ) -> io::Result<Self> {

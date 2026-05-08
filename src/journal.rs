@@ -15,14 +15,35 @@ use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, LittleEndian, U32, U64};
 
 use crate::{
-    BatchingParameter, HashSetMemMap,
+    BatchingParameter, HashSetMemMap, NB_KEY_IN_EACH_GROUP,
     direct_file::{DirectFile, SECTOR_SIZE},
 };
 
 #[derive(Immutable, IntoBytes, FromBytes)]
 #[repr(C)]
+pub struct SlotId {
+    id: U64<LittleEndian>,
+}
+impl SlotId {
+    pub fn from(group_id: u64, group_slot_idx: u64) -> Self {
+        SlotId {
+            id: (group_id * NB_KEY_IN_EACH_GROUP as u64 + group_slot_idx).into(),
+        }
+    }
+
+    pub fn get_group_id(&self) -> usize {
+        (self.id.get() >> 4) as usize
+    }
+
+    pub fn get_group_slot_idx(&self) -> usize {
+        (self.id.get() & 0b1111) as usize
+    }
+}
+
+#[derive(Immutable, IntoBytes, FromBytes)]
+#[repr(C)]
 pub struct JournalLog {
-    pub slot_id: U64<LittleEndian>,
+    pub slot_id: SlotId,
     pub key: U64<LittleEndian>,
 }
 const JOURNAL_LOG_SIZE: usize = size_of::<JournalLog>();
@@ -73,7 +94,7 @@ impl JournalManager {
         directory_path: &Path,
         journal_id: u32,
         batching_param: BatchingParameter,
-        hashset_mmap: &HashSetMemMap,
+        hashset_mmap: &mut HashSetMemMap,
     ) -> io::Result<Option<Self>> {
         let journal_file_path =
             Path::new(directory_path).join(format!("journal-{:}.bin", journal_id));
@@ -181,7 +202,7 @@ struct CheckResult {
 
 async fn check_journal_file(
     journal_file_path: &Path,
-    hashset_mmap: &HashSetMemMap,
+    hashset_mmap: &mut HashSetMemMap,
 ) -> io::Result<CheckResult> {
     let journal_file = OpenOptions::new()
         .read(true)
@@ -247,20 +268,17 @@ async fn check_journal_file(
             )
             .unwrap(); //safe unwrap
 
-            let slot_id = log.slot_id.get() as usize;
+            let slot_id = log.slot_id;
             let key = log.key.get();
+            let ctrl = xxh3_64(&key.to_le_bytes()) as u8 | 0b10_00_00_00;
 
-            unsafe {
-                if change_detected
-                    || *hashset_mmap.ctrl.add(slot_id)
-                        != (xxh3_64(&key.to_le_bytes()) & 0b01_11_11_11) as u8
-                    || *hashset_mmap.key.add(slot_id) != key
-                {
-                    change_detected = true;
-                    *hashset_mmap.ctrl.add(slot_id) =
-                        (xxh3_64(&key.to_le_bytes()) & 0b01_11_11_11) as u8;
-                    *hashset_mmap.key.add(slot_id) = key;
-                }
+            let mut group = hashset_mmap.group(slot_id.get_group_id());
+            if group.get_ctrl(slot_id.get_group_slot_idx()) != ctrl
+                || group.get_key(slot_id.get_group_slot_idx()) != key
+            {
+                println!("{}", key);
+                change_detected = true;
+                group.set(ctrl, key, slot_id.get_group_slot_idx());
             }
 
             read_idx += JOURNAL_LOG_SIZE;
