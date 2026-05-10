@@ -55,13 +55,13 @@ pub struct BatchingParameter {
 
 pub struct BatchingData {
     temp_modif_hashmap: HashMap<usize, TemporaryModificationGroup>,
-    batch_insert_result: Vec<bool>,
+    batch_result: Vec<bool>,
 }
 impl BatchingData {
     pub fn from_param(param: BatchingParameter) -> Self {
         Self {
             temp_modif_hashmap: HashMap::with_capacity(param.pre_allocated_size * 2),
-            batch_insert_result: Vec::with_capacity(param.pre_allocated_size),
+            batch_result: Vec::with_capacity(param.pre_allocated_size),
         }
     }
 }
@@ -84,11 +84,11 @@ enum BatchingGroup {
 impl HashSet {
     pub async fn batch_insert(&mut self, list_key: &[u64]) -> &[bool] {
         self.batching_data.temp_modif_hashmap.clear();
-        self.batching_data.batch_insert_result.clear();
+        self.batching_data.batch_result.clear();
 
         for key in list_key {
             let success = self.batch_insert_one_key(*key).await;
-            self.batching_data.batch_insert_result.push(success);
+            self.batching_data.batch_result.push(success);
         }
 
         self.journal_manager.finalize().await.unwrap();
@@ -98,7 +98,7 @@ impl HashSet {
             modif.apply_on_mmap(&mut self.mmap, group_id);
         }
 
-        &self.batching_data.batch_insert_result
+        &self.batching_data.batch_result
     }
 
     async fn batch_insert_one_key(&mut self, key: u64) -> bool {
@@ -207,14 +207,102 @@ impl HashSet {
             }
         };
 
-        self.journal_manager.add_log(JournalLog {
+        self.journal_manager.add_log(JournalLog::Add {
             slot_id: SlotId::from(
                 selected_group_id as u64,
                 selected_slot.group_slot_idx as u64,
             ),
-            key: key.into(),
+            key,
         });
 
         true
+    }
+
+    pub async fn batch_delete(&mut self, list_key: &[u64]) -> &[bool] {
+        self.batching_data.temp_modif_hashmap.clear();
+        self.batching_data.batch_result.clear();
+
+        for key in list_key {
+            let success = self.batch_delete_one_key(*key).await;
+            self.batching_data.batch_result.push(success);
+        }
+
+        self.journal_manager.finalize().await.unwrap();
+
+        //update file mmap
+        for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
+            modif.apply_on_mmap(&mut self.mmap, group_id);
+        }
+
+        &self.batching_data.batch_result
+    }
+
+    async fn batch_delete_one_key(&mut self, key: u64) -> bool {
+        let key_hash = xxh3_64(&key.to_le_bytes()) as usize;
+        let h2: u8 = key_hash as u8 | 0b10_00_00_00;
+
+        let mut group_id = key_hash >> self.h1_shift;
+        let mut nb_probing = 0;
+
+        loop {
+            let (is_on_mmap, mut group) = self
+                .batching_data
+                .temp_modif_hashmap
+                .get_mut(&group_id)
+                .map_or((true, self.mmap.group(group_id)), |temp_group| {
+                    (false, temp_group.group())
+                });
+            let ctrl_group_simd = group.load_ctrl_simd();
+
+            let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
+            while candidate_mask != 0 {
+                //Iter on each candidate
+                let group_slot_idx = candidate_mask.trailing_zeros() as usize;
+
+                if group.get_key(group_slot_idx) == key {
+                    let empty_mask = unsafe { simd_match_byte(ctrl_group_simd, EMPTY_FLAG) };
+                    let new_ctrl = if empty_mask != 0 {
+                        self.journal_manager.add_log(JournalLog::MakeEmpty {
+                            slot_id: SlotId::from(group_id as u64, group_slot_idx as u64),
+                        });
+                        EMPTY_FLAG
+                    } else {
+                        self.journal_manager.add_log(JournalLog::Delete {
+                            slot_id: SlotId::from(group_id as u64, group_slot_idx as u64),
+                        });
+                        DELETE_FLAG
+                    };
+
+                    if is_on_mmap {
+                        let mut modification =
+                            TemporaryModificationGroup::from_mmap(&self.mmap, group_id);
+
+                        modification.group().set(new_ctrl, 0x00, group_slot_idx);
+
+                        self.batching_data
+                            .temp_modif_hashmap
+                            .insert(group_id, modification);
+                    } else {
+                        group.set(h2, 0x00, group_slot_idx);
+                    }
+
+                    return true;
+                }
+
+                candidate_mask &= candidate_mask - 1;
+            }
+            let empty_mask = unsafe { simd_match_byte(ctrl_group_simd, EMPTY_FLAG) };
+            if empty_mask != 0 {
+                break;
+            }
+
+            nb_probing += 1;
+            group_id += nb_probing;
+            if group_id >= self.nb_group {
+                group_id &= self.nb_group - 1; //nb_group is a pow of 2
+            }
+        }
+
+        false
     }
 }

@@ -1,4 +1,8 @@
-use std::{io::SeekFrom, mem::ManuallyDrop, path::Path};
+use std::{
+    io::{Seek, SeekFrom, Write},
+    mem::ManuallyDrop,
+    path::Path,
+};
 
 use aligned_vec::{ABox, AVec, ConstAlign};
 use libm::{ceil, floor};
@@ -70,14 +74,6 @@ impl DirectFile {
             start_idx,
             write_idx: start_idx,
         })
-    }
-
-    ///Write a slice of bytes, in the write buffer.
-    pub fn write_slice(&mut self, slice: &[u8]) {
-        self.check_enough_space(slice.len());
-
-        self.buffer[self.write_idx..(self.write_idx + slice.len())].copy_from_slice(slice);
-        self.write_idx += slice.len();
     }
 
     ///Add `n` bytes to the write index.
@@ -165,6 +161,28 @@ impl DirectFile {
     ///Returns the file size
     pub fn file_size(&self) -> u64 {
         (self.start_sector + 1) * SECTOR_SIZE_U64
+    }
+}
+
+impl Write for DirectFile {
+    ///Write a slice of bytes, in the write buffer.
+    fn write(&mut self, slice: &[u8]) -> std::io::Result<usize> {
+        self.check_enough_space(slice.len());
+
+        self.buffer[self.write_idx..(self.write_idx + slice.len())].copy_from_slice(slice);
+        self.write_idx += slice.len();
+
+        Ok(slice.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        todo!("not implemented")
+    }
+}
+
+impl Seek for DirectFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        todo!("not implemented")
     }
 }
 

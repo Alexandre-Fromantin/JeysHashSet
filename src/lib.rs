@@ -6,7 +6,7 @@ use std::{io, path::Path};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use xxhash_rust::xxh3::xxh3_64;
-use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, LittleEndian, U32};
 
 pub mod batching;
 mod direct_file;
@@ -57,6 +57,12 @@ impl HashSetGroup {
         }
     }
 
+    fn set_ctrl(&mut self, ctrl: u8, group_slot_idx: usize) {
+        unsafe {
+            *self.ctrl.add(group_slot_idx) = ctrl;
+        }
+    }
+
     fn get_ctrl(&self, group_slot_idx: usize) -> u8 {
         unsafe { *self.ctrl.add(group_slot_idx) }
     }
@@ -83,6 +89,7 @@ pub struct HashSet {
 #[derive(IntoBytes, FromBytes, Immutable)]
 #[repr(C)]
 struct HashSetConfig {
+    version: U32<LittleEndian>,
     degree: u8,
 }
 
@@ -114,7 +121,10 @@ impl HashSet {
             .set_len(ALIGNED_CONFIG_SIZE as u64 + (nb_slot * (1 + size_of::<u64>())) as u64)
             .await?;
 
-        let config = HashSetConfig { degree };
+        let config = HashSetConfig {
+            version: 0x00.into(),
+            degree,
+        };
         data_file.write_all(config.as_bytes()).await.unwrap();
         data_file
             .seek(SeekFrom::Start(ALIGNED_CONFIG_SIZE as u64))
@@ -229,9 +239,9 @@ impl HashSet {
 
         let (selected_group, selected_group_slot_idx) = selected_slot_opt.unwrap(); //safe unwrap
 
-        self.journal_manager.add_log(JournalLog {
+        self.journal_manager.add_log(JournalLog::Add {
             slot_id: SlotId::from(selected_group as u64, selected_group_slot_idx as u64),
-            key: key.into(),
+            key,
         });
         self.journal_manager.finalize().await.unwrap();
 
@@ -239,6 +249,62 @@ impl HashSet {
         group.set(h2, key, selected_group_slot_idx);
 
         true
+    }
+
+    pub async fn delete(&mut self, key: u64) -> bool {
+        let key_hash = xxh3_64(&key.to_le_bytes()) as usize;
+        let h2: u8 = key_hash as u8 | 0b10_00_00_00;
+
+        let mut group_id = key_hash >> self.h1_shift;
+        let mut nb_probing = 0;
+
+        loop {
+            let mut group = self.mmap.group(group_id);
+            let ctrl_simd = group.load_ctrl_simd();
+
+            let mut candidate_mask = unsafe { simd_match_byte(ctrl_simd, h2) };
+            while candidate_mask != 0 {
+                //Iter on each candidate
+                let group_slot_idx = candidate_mask.trailing_zeros() as usize;
+
+                if group.get_key(group_slot_idx) == key {
+                    //key found
+
+                    let empty_mask = unsafe { simd_match_byte(ctrl_simd, EMPTY_FLAG) };
+                    let new_ctrl = if empty_mask != 0 {
+                        self.journal_manager.add_log(JournalLog::MakeEmpty {
+                            slot_id: SlotId::from(group_id as u64, group_slot_idx as u64),
+                        });
+                        EMPTY_FLAG
+                    } else {
+                        self.journal_manager.add_log(JournalLog::Delete {
+                            slot_id: SlotId::from(group_id as u64, group_slot_idx as u64),
+                        });
+                        DELETE_FLAG
+                    };
+                    self.journal_manager.finalize().await.unwrap();
+
+                    group.set(new_ctrl, 0x00, group_slot_idx);
+
+                    return true;
+                }
+
+                candidate_mask &= candidate_mask - 1;
+            }
+
+            let empty_mask = unsafe { simd_match_byte(ctrl_simd, EMPTY_FLAG) };
+            if empty_mask != 0 {
+                break;
+            }
+
+            nb_probing += 1;
+            group_id += nb_probing;
+            if group_id >= self.nb_group {
+                group_id &= self.nb_group - 1; //nb_group is a pow of 2
+            }
+        }
+
+        false
     }
 
     pub fn contains(&self, key: u64) -> bool {

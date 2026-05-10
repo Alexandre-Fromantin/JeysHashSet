@@ -9,6 +9,7 @@ repository = "https://github.com/Alexandre-Fromantin/JeysHashSet"
 [dependencies]
 aligned-vec = "0.6.4"
 crc32fast = "1.5.0"
+deku = "0.20.3"
 futures = "0.3.32"
 libm = "0.2.16"
 memmap2 = "0.9.10"

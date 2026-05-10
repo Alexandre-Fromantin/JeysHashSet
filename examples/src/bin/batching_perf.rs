@@ -5,11 +5,11 @@ use std::{
 
 use jeys_hash_set::{HashSet, batching::BatchingParameter};
 use tokio::{fs, io};
-use tracing::{Level, info};
+use tracing::{Level, debug, info};
 use tracing_subscriber::FmtSubscriber;
 
-const DEGREE: u8 = 29;
-const NB_INSERT: u32 = 2u32.pow(20);
+const DEGREE: u8 = 20;
+const NB_INSERT: u32 = 2u32.pow(DEGREE as u32 + 3);
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -48,6 +48,38 @@ async fn main() -> io::Result<()> {
             elapsed / NB_INSERT
         );
         println!();
+
+        for i in 0..NB_INSERT as u64 {
+            let exist = hash_set.contains(i);
+            if !exist {
+                info!("error")
+            }
+        }
+
+        time = Instant::now();
+        for i in 0..(NB_INSERT / batching_size) {
+            data.clear();
+            for y in 0..batching_size {
+                data.push(i as u64 * batching_size as u64 + y as u64);
+            }
+            hash_set.batch_delete(&data).await;
+        }
+        let elapsed = time.elapsed();
+        info!(
+            "for batching size: {} | {} delete time: {:?} | {:?}/delete",
+            batching_size,
+            NB_INSERT,
+            elapsed,
+            elapsed / NB_INSERT
+        );
+        println!();
+
+        for i in 0..NB_INSERT as u64 {
+            let exist = hash_set.contains(i);
+            if exist {
+                info!("error")
+            }
+        }
 
         drop(hash_set);
 
