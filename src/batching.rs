@@ -81,6 +81,12 @@ enum BatchingGroup {
     },
 }
 
+pub enum BatchAction {
+    Insert,
+    Delete,
+    Contains,
+}
+
 impl HashSet {
     pub async fn batch_insert(&mut self, list_key: &[u64]) -> &[bool] {
         self.batching_data.temp_modif_hashmap.clear();
@@ -286,6 +292,70 @@ impl HashSet {
                         group.set(h2, 0x00, group_slot_idx);
                     }
 
+                    return true;
+                }
+
+                candidate_mask &= candidate_mask - 1;
+            }
+            let empty_mask = unsafe { simd_match_byte(ctrl_group_simd, EMPTY_FLAG) };
+            if empty_mask != 0 {
+                break;
+            }
+
+            nb_probing += 1;
+            group_id += nb_probing;
+            if group_id >= self.nb_group {
+                group_id &= self.nb_group - 1; //nb_group is a pow of 2
+            }
+        }
+
+        false
+    }
+
+    pub async fn batch(&mut self, list_action: &[(BatchAction, u64)]) -> &[bool] {
+        self.batching_data.temp_modif_hashmap.clear();
+        self.batching_data.batch_result.clear();
+
+        for (action, key) in list_action {
+            let success = match action {
+                BatchAction::Insert => self.batch_insert_one_key(*key).await,
+                BatchAction::Delete => self.batch_delete_one_key(*key).await,
+                BatchAction::Contains => self.batch_contains_one_key(*key).await,
+            };
+            self.batching_data.batch_result.push(success);
+        }
+
+        self.journal_manager.finalize().await.unwrap();
+
+        //update file mmap
+        for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
+            modif.apply_on_mmap(&mut self.mmap, group_id);
+        }
+
+        &self.batching_data.batch_result
+    }
+
+    async fn batch_contains_one_key(&mut self, key: u64) -> bool {
+        let key_hash = xxh3_64(&key.to_le_bytes()) as usize;
+        let h2: u8 = key_hash as u8 | 0b10_00_00_00;
+
+        let mut group_id = key_hash >> self.h1_shift;
+        let mut nb_probing = 0;
+
+        loop {
+            let group = self
+                .batching_data
+                .temp_modif_hashmap
+                .get_mut(&group_id)
+                .map_or(self.mmap.group(group_id), |temp_group| temp_group.group());
+            let ctrl_group_simd = group.load_ctrl_simd();
+
+            let mut candidate_mask = unsafe { simd_match_byte(ctrl_group_simd, h2) };
+            while candidate_mask != 0 {
+                //Iter on each candidate
+                let group_slot_idx = candidate_mask.trailing_zeros() as usize;
+
+                if group.get_key(group_slot_idx) == key {
                     return true;
                 }
 
