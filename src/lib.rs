@@ -12,6 +12,7 @@ pub mod batching;
 mod direct_file;
 mod flush;
 mod journal;
+mod manager;
 mod multi_journal;
 mod simd;
 
@@ -135,7 +136,9 @@ impl HashSet {
 
         let mmap = HashSetMemMap::from_file(&data_file)?;
         let journal_manager =
-            MultiJournalManager::new(&mmap, directory_path.into(), batching_param).await?;
+            MultiJournalManager::new(&mmap, directory_path.into(), batching_param)
+                .await
+                .unwrap();
 
         Ok(Self {
             data_file,
@@ -169,7 +172,8 @@ impl HashSet {
         let mut mmap = HashSetMemMap::from_file(&data_file)?;
         let journal_manager =
             MultiJournalManager::from_directory(&mut mmap, directory_path.into(), batching_param)
-                .await?;
+                .await
+                .unwrap();
 
         Ok(Self {
             data_file,
@@ -349,6 +353,8 @@ struct HashSetMemMap {
     data_ptr: *mut u8,
 }
 
+unsafe impl Send for HashSetMemMap {}
+
 impl HashSetMemMap {
     pub fn from_file(data_file: &File) -> io::Result<Self> {
         let mut data_file_mmap = unsafe { MmapMut::map_mut(data_file)? };
@@ -390,6 +396,6 @@ impl HashSetMemMap {
 
 impl Drop for HashSetMemMap {
     fn drop(&mut self) {
-        self.mmap_arc.flush().unwrap();
+        self.mmap_arc.flush();
     }
 }

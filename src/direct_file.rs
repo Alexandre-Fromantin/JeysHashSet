@@ -78,7 +78,7 @@ impl DirectFile {
 
     ///Add `n` bytes to the write index.
     pub fn skip(&mut self, n: usize) {
-        self.check_enough_space(n);
+        self.allocate_enough_space(n);
         self.write_idx += n;
     }
 
@@ -90,7 +90,7 @@ impl DirectFile {
     ///Check if the current write buffer is long enough for a write of `space_needed` bytes.
     ///
     ///If the current write buffer is not long enough, it resizes the write buffer by adding the necessary sector amount for a write of `space_needed` bytes.
-    fn check_enough_space(&mut self, space_needed: usize) {
+    fn allocate_enough_space(&mut self, space_needed: usize) {
         if self.remaining_free_space() < space_needed {
             //not enough space
             debug!("not enough space in write buffer");
@@ -167,7 +167,7 @@ impl DirectFile {
 impl Write for DirectFile {
     ///Write a slice of bytes, in the write buffer.
     fn write(&mut self, slice: &[u8]) -> std::io::Result<usize> {
-        self.check_enough_space(slice.len());
+        self.allocate_enough_space(slice.len());
 
         self.buffer[self.write_idx..(self.write_idx + slice.len())].copy_from_slice(slice);
         self.write_idx += slice.len();

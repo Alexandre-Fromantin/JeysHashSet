@@ -55,13 +55,11 @@ pub struct BatchingParameter {
 
 pub struct BatchingData {
     temp_modif_hashmap: HashMap<usize, TemporaryModificationGroup>,
-    batch_result: Vec<bool>,
 }
 impl BatchingData {
     pub fn from_param(param: BatchingParameter) -> Self {
         Self {
             temp_modif_hashmap: HashMap::with_capacity(param.pre_allocated_size * 2),
-            batch_result: Vec::with_capacity(param.pre_allocated_size),
         }
     }
 }
@@ -81,20 +79,22 @@ enum BatchingGroup {
     },
 }
 
-pub enum BatchAction {
-    Insert,
-    Delete,
-    Contains,
+#[derive(Clone, Copy)]
+pub enum BatchingAction {
+    Insert { key: u64 },
+    Delete { key: u64 },
+    Contains { key: u64 },
 }
 
 impl HashSet {
-    pub async fn batch_insert(&mut self, list_key: &[u64]) -> &[bool] {
+    pub async fn batch_insert<'a>(
+        &mut self,
+        batch_iter: impl Iterator<Item = (u64, &'a mut Option<bool>)>,
+    ) {
         self.batching_data.temp_modif_hashmap.clear();
-        self.batching_data.batch_result.clear();
 
-        for key in list_key {
-            let success = self.batch_insert_one_key(*key).await;
-            self.batching_data.batch_result.push(success);
+        for (key, success) in batch_iter {
+            *success = Some(self.batch_insert_one_key(key).await);
         }
 
         self.journal_manager.finalize().await.unwrap();
@@ -103,8 +103,6 @@ impl HashSet {
         for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
             modif.apply_on_mmap(&mut self.mmap, group_id);
         }
-
-        &self.batching_data.batch_result
     }
 
     async fn batch_insert_one_key(&mut self, key: u64) -> bool {
@@ -224,13 +222,14 @@ impl HashSet {
         true
     }
 
-    pub async fn batch_delete(&mut self, list_key: &[u64]) -> &[bool] {
+    pub async fn batch_delete<'a>(
+        &mut self,
+        batch_iter: impl Iterator<Item = (u64, &'a mut Option<bool>)>,
+    ) {
         self.batching_data.temp_modif_hashmap.clear();
-        self.batching_data.batch_result.clear();
 
-        for key in list_key {
-            let success = self.batch_delete_one_key(*key).await;
-            self.batching_data.batch_result.push(success);
+        for (key, success) in batch_iter {
+            *success = Some(self.batch_delete_one_key(key).await);
         }
 
         self.journal_manager.finalize().await.unwrap();
@@ -239,8 +238,6 @@ impl HashSet {
         for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
             modif.apply_on_mmap(&mut self.mmap, group_id);
         }
-
-        &self.batching_data.batch_result
     }
 
     async fn batch_delete_one_key(&mut self, key: u64) -> bool {
@@ -312,17 +309,18 @@ impl HashSet {
         false
     }
 
-    pub async fn batch(&mut self, list_action: &[(BatchAction, u64)]) -> &[bool] {
+    pub async fn batch<'a>(
+        &mut self,
+        batch_iter: impl Iterator<Item = (BatchingAction, &'a mut Option<bool>)>,
+    ) {
         self.batching_data.temp_modif_hashmap.clear();
-        self.batching_data.batch_result.clear();
 
-        for (action, key) in list_action {
-            let success = match action {
-                BatchAction::Insert => self.batch_insert_one_key(*key).await,
-                BatchAction::Delete => self.batch_delete_one_key(*key).await,
-                BatchAction::Contains => self.batch_contains_one_key(*key).await,
-            };
-            self.batching_data.batch_result.push(success);
+        for (action, success) in batch_iter {
+            *success = Some(match action {
+                BatchingAction::Insert { key } => self.batch_insert_one_key(key).await,
+                BatchingAction::Delete { key } => self.batch_delete_one_key(key).await,
+                BatchingAction::Contains { key } => self.batch_contains_one_key(key).await,
+            });
         }
 
         self.journal_manager.finalize().await.unwrap();
@@ -331,8 +329,6 @@ impl HashSet {
         for (&group_id, modif) in &self.batching_data.temp_modif_hashmap {
             modif.apply_on_mmap(&mut self.mmap, group_id);
         }
-
-        &self.batching_data.batch_result
     }
 
     async fn batch_contains_one_key(&mut self, key: u64) -> bool {

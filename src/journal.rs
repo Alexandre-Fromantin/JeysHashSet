@@ -92,12 +92,14 @@ impl JournalManager {
     ) -> io::Result<Self> {
         let journal_file_path =
             Path::new(directory_path).join(format!("journal-{:}.bin", journal_id));
+
         let mut journal_file = DirectFile::new(
             &journal_file_path,
             nb_allocated_sector_for_batching_param(batching_param),
         )
         .await?;
-        journal_file.skip(JOURNAL_HEADER_SIZE);
+
+        journal_file.skip(JOURNAL_HEADER_SIZE); //reserve header space
 
         Ok(Self {
             journal_file,
@@ -298,12 +300,12 @@ async fn check_journal_file(
 
         while journal_cursor.position() < after_header_pos + block_length {
             let log_res = JournalLog::from_reader((&mut journal_cursor, 0));
-            if let Err(log_err) = log_res {
+            let Ok((_, log)) = log_res else {
+                let log_err = log_res.unwrap_err();
                 warn!("Journal file corrupted (deku error: {})", log_err);
                 file_corrupted = true;
                 break;
-            }
-            let (_, log) = log_res.unwrap();
+            };
             match log {
                 JournalLog::Delete { slot_id } => {
                     let ctrl = DELETE_FLAG;
