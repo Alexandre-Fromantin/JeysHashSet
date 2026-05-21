@@ -7,7 +7,7 @@ use tokio::{
 
 use crate::{
     HashSet,
-    batching::{BatchingAction, BatchingParameter},
+    batching::{BatchingParameter, HashSetAction},
 };
 
 struct BatchingStrategy {
@@ -19,9 +19,24 @@ struct BatchingStrategy {
 }
 
 struct BatchElement {
-    batching_action: BatchingAction,
+    hashset_action: HashSetAction,
     success_opt: Option<bool>,
     responder: oneshot::Sender<bool>,
+}
+
+impl BatchElement {
+    pub fn new(hashset_action: HashSetAction) -> (Self, oneshot::Receiver<bool>) {
+        let (responder, reponse_receiver) = oneshot::channel();
+
+        return (
+            BatchElement {
+                hashset_action,
+                success_opt: None,
+                responder,
+            },
+            reponse_receiver,
+        );
+    }
 }
 
 struct TaskWorker {
@@ -46,7 +61,7 @@ impl<'a> BatchIterator<'a> {
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
-    type Item = (BatchingAction, &'a mut Option<bool>);
+    type Item = (HashSetAction, &'a mut Option<bool>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.iter_index < self.batch.len() {
@@ -54,7 +69,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 let element_ptr = self.batch.as_mut_ptr().add(self.iter_index);
                 self.iter_index += 1;
                 Some((
-                    (*element_ptr).batching_action,
+                    (*element_ptr).hashset_action,
                     &mut (*element_ptr).success_opt,
                 ))
             }
@@ -170,5 +185,29 @@ impl HashSetManager {
         Ok(Self {
             batch_element_sender,
         })
+    }
+
+    pub async fn insert(&mut self, key: u64) -> Result<bool, ()> {
+        self.action(HashSetAction::Insert { key }).await
+    }
+
+    pub async fn delete(&mut self, key: u64) -> Result<bool, ()> {
+        self.action(HashSetAction::Delete { key }).await
+    }
+
+    pub async fn contains(&mut self, key: u64) -> Result<bool, ()> {
+        self.action(HashSetAction::Contains { key }).await
+    }
+
+    async fn action(&mut self, action: HashSetAction) -> Result<bool, ()> {
+        let (batch_el, reponse_receiver) = BatchElement::new(action);
+        if let Err(_send_error) = self.batch_element_sender.send(batch_el).await {
+            return Err(());
+        }
+        let Ok(response) = reponse_receiver.await else {
+            return Err(());
+        };
+
+        Ok(response)
     }
 }

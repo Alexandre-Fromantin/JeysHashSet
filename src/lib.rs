@@ -103,13 +103,10 @@ impl HashSet {
         degree: u8,
         batching_param: BatchingParameter,
     ) -> io::Result<Self> {
-        use windows::Win32::Storage::FileSystem;
-
         let data_file_path = Path::new(directory_path).join("data.bin");
         let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(FileSystem::FILE_FLAG_RANDOM_ACCESS.0)
             .create_new(true)
             .open(data_file_path)
             .await?;

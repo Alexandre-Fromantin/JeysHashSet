@@ -80,7 +80,7 @@ enum BatchingGroup {
 }
 
 #[derive(Clone, Copy)]
-pub enum BatchingAction {
+pub enum HashSetAction {
     Insert { key: u64 },
     Delete { key: u64 },
     Contains { key: u64 },
@@ -311,15 +311,15 @@ impl HashSet {
 
     pub async fn batch<'a>(
         &mut self,
-        batch_iter: impl Iterator<Item = (BatchingAction, &'a mut Option<bool>)>,
+        batch_iter: impl Iterator<Item = (HashSetAction, &'a mut Option<bool>)>,
     ) {
         self.batching_data.temp_modif_hashmap.clear();
 
         for (action, success) in batch_iter {
             *success = Some(match action {
-                BatchingAction::Insert { key } => self.batch_insert_one_key(key).await,
-                BatchingAction::Delete { key } => self.batch_delete_one_key(key).await,
-                BatchingAction::Contains { key } => self.batch_contains_one_key(key).await,
+                HashSetAction::Insert { key } => self.batch_insert_one_key(key).await,
+                HashSetAction::Delete { key } => self.batch_delete_one_key(key).await,
+                HashSetAction::Contains { key } => self.batch_contains_one_key(key).await,
             });
         }
 
